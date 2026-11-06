@@ -66,6 +66,51 @@ def get_resource_path(relative_path: Union[str, Path]) -> str:
     return resource_path(relative_path)
 
 
+def get_vosk_model_path(custom_path: Optional[str] = None) -> str:
+    """
+    Tìm kiếm và trả về đường dẫn mô hình Vosk tiếng Việt tối ưu nhất:
+    Ưu tiên:
+    1. custom_path (nếu được truyền vào và tồn tại).
+    2. Mô hình Medium tiếng Việt: 'vosk-model-vn-0.22' (~1.5GB) tại thư mục dự án hoặc cache.
+    3. Thư mục 'model_medium'.
+    4. Thư mục 'model' (Small model dự phòng ~45MB) để hệ thống luôn hoạt động mượt mà.
+    """
+    if custom_path and Path(custom_path).exists():
+        return str(Path(custom_path).resolve())
+
+    # Danh sách các thư mục ưu tiên mô hình Medium
+    medium_candidates = [
+        get_exe_dir() / "vosk-model-vn-0.22",
+        get_base_dir() / "vosk-model-vn-0.22",
+        Path("vosk-model-vn-0.22"),
+        get_exe_dir() / "vosk-model-vn-0.4",
+        get_base_dir() / "vosk-model-vn-0.4",
+        Path("vosk-model-vn-0.4"),
+        get_exe_dir() / "model_medium",
+        get_base_dir() / "model_medium",
+        Path.home() / ".cache" / "vosk" / "vosk-model-vn-0.22",
+        Path.home() / ".cache" / "vosk" / "vosk-model-vn-0.4",
+    ]
+
+    for p in medium_candidates:
+        if p.exists() and (p / "am").exists():
+            return str(p.resolve())
+
+    # Danh sách dự phòng mô hình Small (model)
+    small_candidates = [
+        get_exe_dir() / "model",
+        get_base_dir() / "model",
+        Path("model"),
+        Path.home() / ".cache" / "vosk" / "vosk-model-small-vn-0.4",
+    ]
+
+    for p in small_candidates:
+        if p.exists():
+            return str(p.resolve())
+
+    return resource_path("model")
+
+
 def get_data_path(relative_path: Union[str, Path], default_content: str = "{}") -> str:
     """
     Lấy đường dẫn tuyệt đối đến file dữ liệu đọc/ghi (JSON learning, memory, phonetics, config):

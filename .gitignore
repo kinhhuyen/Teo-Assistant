@@ -13,6 +13,7 @@ __pycache__/
 build/
 dist/
 *.spec
+!TeoAssistant.spec
 *.zip
 
 
@@ -24,11 +25,14 @@ dist/
 !.env.example
 
 # ==========================================
-# Personal / Local Learning Data Files
+# Personal / Local Learning Data Files & Biometrics
 # ==========================================
 memory.json
+config.json
 learned_phonetics.json
 offline_learning.json
+my_voice.pkl
+*.pkl
 test_*.json
 *.jsonl
 
@@ -36,6 +40,8 @@ test_*.json
 # Heavy Offline Models (Downloaded locally)
 # ==========================================
 model/
+vosk-model-vn-0.4/
+vosk-model-vn-0.22/
 *.onnx
 *.tflite
 

@@ -49,10 +49,26 @@ class Brain:
         "rề vô": "revo uninstaller",
         "in sờ to lơ": "revo uninstaller",
         "chôm": "chrome",
+        "pao pót": "powerpoint",
+        "bao boy": "powerpoint",
+        "power point": "powerpoint",
     }
 
     # Từ điển FUZZY_MAP mở rộng: Map mạnh mẽ các biến thể nghe nhầm / phiên âm tiếng Việt thành app chuẩn
     FUZZY_MAP: Dict[str, str] = {
+        # powerpoint
+        "powerpoint": "powerpoint",
+        "power point": "powerpoint",
+        "microsoft powerpoint": "powerpoint",
+        "pao o pót": "powerpoint",
+        "pao pót": "powerpoint",
+        "pau pót": "powerpoint",
+        "bao boy": "powerpoint",
+        "bao o poi": "powerpoint",
+        "pao po": "powerpoint",
+        "pao o poi": "powerpoint",
+        "pao boi": "powerpoint",
+
         # chrome
         "chờ rộng": "chrome",
         "chờ rôm": "chrome",
@@ -305,12 +321,26 @@ class Brain:
         "chứng khoác": "chứng khoán",
     }
 
-    # Danh sách các app chuẩn trong WHITELIST
+    # Danh sách các tiến trình hệ thống nguy hiểm - Tuyệt đối không cho phép tắt để bảo vệ máy tính
+    SYSTEM_BLACKLIST = {
+        "explorer.exe", "explorer",
+        "svchost.exe", "svchost",
+        "csrss.exe", "csrss",
+        "winlogon.exe", "winlogon",
+        "system", "system.exe",
+        "registry", "registry.exe",
+        "smss.exe", "smss",
+        "services.exe", "services",
+        "lsass.exe", "lsass"
+    }
+
+    # Danh sách các app chuẩn trong WHITELIST (dùng để kiểm soát an toàn khi mở ứng dụng)
     WHITELIST = {
         "chrome", "edge", "notepad", "calc", "máy tính", "word",
         "excel", "cmd", "explorer", "thư mục", "zalo", "coccoc",
         "paint", "spotify", "discord", "github", "microsoft store",
-        "telegram", "settings", "antigravity", "revo uninstaller"
+        "telegram", "settings", "antigravity", "revo uninstaller",
+        "powerpoint", "capcut", "tiktok"
     }
 
     # Danh sách app hợp lệ để kiểm tra và chống ảo giác LLM
@@ -338,12 +368,13 @@ QUY TẮC PHÂN BIỆT ĐỘ SÁNG VÀ ÂM LƯỢNG (BẮT BUỘC TUÂN THỦ):
 - Nếu câu lệnh có từ "âm lượng", "âm thanh", "tiếng" -> BẮT BUỘC trả về action "volume" (TUYỆT ĐỐI KHÔNG trả về brightness).
 
 QUY TẮC SUY ĐOÁN TÊN ỨNG DỤNG VÀ PHIÊN ÂM TIẾNG ANH (Chỉ áp dụng khi CÓ ĐỘNG TỪ MỞ/BẬT/CHẠY/TẮT/ĐÓNG/KHỞI ĐỘNG):
-- DANH SÁCH APP HỢP LỆ DUY NHẤT TRONG WHITELIST: chrome, edge, zalo, notepad, máy tính, calc, word, excel, cmd, coccoc, paint, spotify, discord, github, microsoft store, telegram, settings, antigravity, revo uninstaller.
+- DANH SÁCH APP MỞ HỢP LỆ: chrome, edge, zalo, notepad, máy tính, calc, word, excel, powerpoint, cmd, coccoc, paint, spotify, discord, github, microsoft store, telegram, settings, antigravity, revo uninstaller, capcut, tiktok.
 - QUY TẮC ĐẶC BIỆT VỀ PHIÊN ÂM ANH-VIỆT:
-  Người dùng Việt Nam thường phát âm tên app tiếng Anh theo phiên âm tiếng Việt (Ví dụ: 'đít cọt' = discord, 'sờ pốt ti' = spotify). Nếu gặp từ lạ trong câu 'mở [X]', hãy suy luận xem đó là app tiếng Anh nào trong danh sách hỗ trợ.
-  Các từ phiên âm này ĐƯỢC XEM LÀ TÊN PHẦN MỀM HỢP LỆ (KHÔNG PHẢI VÔ NGHĨA). Khi gặp 'mở [X]', 'bật [X]', 'chạy [X]' với [X] là từ lạ, BẮT BUỘC SUY LUẬN xem [X] tương ứng với app nào trong danh sách WHITELIST.
+  Người dùng Việt Nam thường phát âm tên app tiếng Anh theo phiên âm tiếng Việt (Ví dụ: 'đít cọt' = discord, 'sờ pốt ti' = spotify, 'bao boy' / 'pao pót' = powerpoint). Nếu gặp từ lạ trong câu 'mở [X]', hãy suy luận xem đó là app tiếng Anh nào trong danh sách hỗ trợ.
+  Các từ phiên âm này ĐƯỢC XEM LÀ TÊN PHẦN MỀM HỢP LỆ (KHÔNG PHẢI VÔ NGHĨA). Khi gặp 'mở [X]', 'bật [X]', 'chạy [X]' với [X] là từ lạ, BẮT BUỘC SUY LUẬN xem [X] tương ứng với app nào trong danh sách hỗ trợ.
   + Ví dụ phiên âm:
     * "quật", "guốt", "quớt", "guốc", "uốt" -> app: "word"
+    * "pao pót", "bao boy", "pao o pót", "power point" -> app: "powerpoint"
     * "an ti gra vơ ti", "an ti", "an ti gra vi ti" -> app: "antigravity"
     * "rề vô", "in sờ to lơ", "revo" -> app: "revo uninstaller"
     * "chôm", "chờ rôm", "chờ rộng", "cờ rôm", "cờ rô", "gu gồ" -> app: "chrome"
@@ -360,7 +391,7 @@ QUY TẮC SUY ĐOÁN TÊN ỨNG DỤNG VÀ PHIÊN ÂM TIẾNG ANH (Chỉ áp d�
     * "nốt bát", "nốc bát", "nốt pát" -> app: "notepad"
     * "máy bân", "mê tân", "máy tình" -> app: "máy tính" (calc)
     * "phay ếch pờ lo rơ", "phay ếch", "phai ếch", "phai", "ếp lò hương", "ưu phai" -> action: "open_explorer"
-- Bất kỳ app nào không thuộc WHITELIST -> BẮT BUỘC trả về {"action": "unknown"}.
+- QUY TẮC ĐÓNG ỨNG DỤNG (close_app): Cho phép đóng mọi ứng dụng theo yêu cầu (ví dụ: powerpoint, word, excel, chrome, zalo...). CHỈ chặn và trả về {"action": "unknown"} đối với các tiến trình hệ thống nguy hiểm (explorer, svchost, system, registry, csrss, winlogon).
 
 QUY TẮC THÔNG MINH CHO LỆNH TÌM KIẾM (search_web - BẢO TOÀN NGUYÊN VĂN & CHỈ SỬA LỖI NẶNG):
 - Kích hoạt khi câu lệnh có ý định tìm kiếm trên web ("tìm kiếm", "tìm", "tra cứu", "kiếm", "định giá", "xem", "search", "google", v.v.).
@@ -374,8 +405,8 @@ QUY TẮC THÔNG MINH CHO LỆNH TÌM KIẾM (search_web - BẢO TOÀN NGUYÊN V
   + "chứng khoác" -> query: "chứng khoán".
 
 Danh sách Action hợp lệ:
-- open_app: {"action": "open_app", "name": "<tên app trong whitelist>"}
-- close_app: {"action": "close_app", "name": "<tên app trong whitelist>"}
+- open_app: {"action": "open_app", "name": "<tên app>"}
+- close_app: {"action": "close_app", "name": "<tên app cần đóng>"}
 - search_web: {"action": "search_web", "query": "<từ khóa tìm kiếm đã được chuẩn hóa/sửa lỗi chính tả>"}
 - screenshot: {"action": "screenshot"}
 - lock_screen: {"action": "lock_screen"}
@@ -610,12 +641,54 @@ Output: {"actions": [{"action": "screenshot"}, {"action": "shutdown"}]}
 
     def _fast_path(self, text: str) -> Optional[List[Dict[str, Any]]]:
         """
-        FAST PATH: Sử dụng biểu thức chính quy (Regex) kết hợp từ điển FUZZY_MAP.
+        FAST PATH (Nâng cấp Hybrid & Quét toàn bộ lệnh kết hợp):
+        - Tự động phát hiện và tách câu lệnh kết hợp bằng:
+          + Liên từ: " và ", " rồi ", " sau đó ", " tiếp theo ", " đồng thời ", dấu phẩy ","
+          + Hoặc lặp lại nhiều động từ mở/bật: "mở powerpoint mở excel", "bật chrome bật word", "mở word và mở zalo"
+        - Chạy Fast Path cho từng phần và gộp thành danh sách actions độc lập, không đẩy sang Ollama.
+        - Với câu đơn: chạy qua _fast_path_single.
+        """
+        if not text:
+            return None
+
+        raw_cleaned = text.strip().rstrip(".!?;:")
+        cleaned = raw_cleaned.lower()
+
+        # 1. NÂNG CẤP FAST PATH: TÁCH LỆNH KẾT HỢP (Mở X Mở Y / Mở X và Mở Y / Mở X rồi Y)
+        # Regex chia tách theo:
+        # a) Dấu phẩy hoặc liên từ ("và", "rồi", "sau đó", "tiếp theo", "đồng thời", "cùng với")
+        # b) Hoặc ngay trước một động từ mở/bật/tắt mới (lookahead: (?=\s+(?:mở|mỡ|bật|vỡ|chạy|khởi\s+động|tắt|đóng)\s+))
+        split_pattern = r"(?:,\s*|\s+(?:và|rồi|sau\s+đó|tiếp\s+theo|đồng\s+thời|cùng\s+với)\s+|\s+(?=(?:mở|mỡ|bật|vỡ|chạy|khởi\s+động|tắt|đóng)\s+))"
+        parts = [p.strip() for p in re.split(split_pattern, raw_cleaned, flags=re.IGNORECASE) if p.strip()]
+
+        if len(parts) > 1:
+            combined_actions = []
+            all_matched = True
+            for part in parts:
+                part_actions = self._fast_path_single(part)
+                if part_actions and not all(a.get("action") == "unknown" for a in part_actions):
+                    combined_actions.extend(part_actions)
+                else:
+                    all_matched = False
+                    break
+
+            if all_matched and combined_actions:
+                print(f"[Brain: FAST PATH (Tách đa lệnh)] Đã nhận diện thành công {len(parts)} lệnh độc lập -> {combined_actions}")
+                return combined_actions
+            else:
+                print(f"[Brain: FAST PATH (Tách đa lệnh)] Có vế không khớp Fast Path -> chuyển sang SLOW PATH (LLM)...")
+                return None
+
+        # 2. Chạy qua bộ Fast Path cho câu đơn lẻ
+        return self._fast_path_single(text)
+
+    def _fast_path_single(self, text: str) -> Optional[List[Dict[str, Any]]]:
+        """
+        FAST PATH CÂU ĐƠN: Sử dụng biểu thức chính quy (Regex) kết hợp từ điển FUZZY_MAP.
         - Bắt nhanh mọi câu lệnh tìm kiếm ("tìm kiếm", "tìm", "tra cứu", "google", "tìm giúp tôi"...)
           và trích xuất query tức thì (<1ms), không cần gọi LLM, bảo toàn 100% nguyên văn.
-        - Nếu câu nói chứa các từ nối (" và ", " rồi ", " sau đó ", " tiếp theo ") hoặc có dấu phẩy ","
-          đi kèm hành động khác: chuyển sang SLOW PATH (LLM) phân tách nhiều action.
-        - Nếu sau khi map vẫn không khớp Whitelist, chuyển sang Slow Path (LLM) để đoán thay vì chặn.
+        - Xử lý các lệnh hệ thống: wifi, bluetooth, độ sáng màn hình, âm lượng, khóa máy, tắt máy...
+        - Xử lý mở/đóng ứng dụng, mở thư mục, mở ổ đĩa.
         """
         if not text:
             return None
@@ -632,7 +705,7 @@ Output: {"actions": [{"action": "screenshot"}, {"action": "shutdown"}]}
         )
         if match_search:
             raw_query = match_search.group(1).strip()
-            # Kiểm tra xem có phải câu lệnh ghép kèm hành động thứ hai không (ví dụ: 'tìm giá vàng rồi tắt máy', 'tìm bitcoin và mở chrome')
+            # Kiểm tra xem có phải câu lệnh ghép kèm hành động thứ hai không (ví dụ: 'tìm giá vàng rồi tắt máy')
             has_action_after = bool(
                 re.search(
                     r"(?:,|\s+(?:và|rồi|sau\s+đó|tiếp\s+theo|đồng\s+thời|cùng\s+với))\s*(?:mở|mỡ|bật|chạy|khởi\s+động|tắt|đóng|thoát|chụp|khóa|khoá|restart|reboot)\b",
@@ -655,13 +728,6 @@ Output: {"actions": [{"action": "screenshot"}, {"action": "shutdown"}]}
         if match_direct_topic:
             clean_query = self._correct_search_query(raw_cleaned)
             return [{"action": "search_web", "query": clean_query}]
-
-        # 2. BỎ QUA FAST PATH nếu là câu lệnh kết hợp / đa hành động (có từ nối hoặc dấu phẩy)
-        padded = f" {cleaned} "
-        compound_conjunctions = [" và ", " rồi ", " sau đó ", " tiếp theo ", " đồng thời ", " cùng với "]
-        if "," in text or any(conj in padded for conj in compound_conjunctions):
-            print(f"[Brain: FAST PATH] Phát hiện lệnh kết hợp (có từ nối hoặc dấu phẩy) -> Bỏ qua Fast Path, chuyển sang SLOW PATH (LLM)...")
-            return None
 
         # 3. Lệnh khóa máy / khóa màn hình (lock_screen)
         if re.match(r"^(?:khóa|khoá)\s+(?:máy|máy\s+tính|màn\s+hình|pc)$|^(?:lock|lock\s*screen|lock\s*pc)$", cleaned):
@@ -789,6 +855,24 @@ Output: {"actions": [{"action": "screenshot"}, {"action": "shutdown"}]}
         )
         if match_open:
             raw_app = match_open.group(1).strip()
+
+            # BẢO VỆ PHỤ: Nếu raw_app vẫn chứa từ khóa mở/bật (ví dụ câu nói lọt vào 'powerpoint mở excel')
+            if re.search(r"\b(?:mở|mỡ|bật|vỡ|chạy)\b", raw_app, re.IGNORECASE):
+                sub_parts = [a.strip() for a in re.split(r"\s+(?:mở|mỡ|bật|vỡ|chạy|và)\s+", raw_app, flags=re.IGNORECASE) if a.strip()]
+                sub_actions = []
+                for sp in sub_parts:
+                    mapped = self.fuzzy_map.get(sp, sp)
+                    if mapped in ("explorer", "thư mục"):
+                        sub_actions.append({"action": "open_explorer"})
+                    elif mapped in self.FOLDER_TARGETS:
+                        sub_actions.append({"action": "open_folder", "folder": mapped})
+                    elif mapped in self.SEARCH_TOPICS:
+                        sub_actions.append({"action": "search_web", "query": mapped})
+                    elif mapped:
+                        sub_actions.append({"action": "open_app", "name": mapped})
+                if sub_actions:
+                    return sub_actions
+
             # Bước 1: Đưa qua fuzzy_map (kết hợp cả từ tĩnh và từ tự học)
             mapped_app = self.fuzzy_map.get(raw_app, raw_app)
 
@@ -805,20 +889,47 @@ Output: {"actions": [{"action": "screenshot"}, {"action": "shutdown"}]}
             if mapped_app:
                 return [{"action": "open_app", "name": mapped_app}]
 
-        # 14. Lệnh đóng ứng dụng: "đóng [tên app]", "tắt [tên app]"
+        # 14. FAST PATH LỆNH ĐÓNG/TẮT ỨNG DỤNG: "đóng [app]", "tắt [app]", "thoát [app]"
         match_close = re.match(
-            r"^(?:đóng|tắt|thoát|dừng)\s+(?:ứng\s+dụng|phần\s+mềm|app)?\s*(.+)$",
+            r"^(?:đóng|tắt|thoát|dừng|kill|exit|quit)\s+(?:ứng\s+dụng|phần\s+mềm|app|trình\s+duyệt)?\s*(.+)$",
             cleaned
         )
         if match_close:
             raw_app = match_close.group(1).strip()
-            if raw_app in ("máy", "máy tính", "pc"):
+            # Tắt máy / PC
+            if raw_app in ("máy", "máy tính", "pc", "hệ thống"):
                 return [{"action": "shutdown"}]
+            # Tắt wifi
+            if re.match(r"^(?:wifi|wi-fi|mạng\s*wifi|mạng\s*wi-fi)$", raw_app):
+                return [{"action": "wifi", "state": "off"}]
+            # Tắt bluetooth
+            if re.match(r"^(?:bluetooth|búp\s*tút|bờ\s*lu\s*tút)$", raw_app):
+                return [{"action": "bluetooth", "state": "off"}]
+
+            # BẢO VỆ PHỤ: Nếu raw_app vẫn chứa từ khóa tắt/đóng lặp lại (ví dụ câu ghép lọt vào 'powerpoint tắt excel')
+            if re.search(r"\b(?:tắt|đóng|thoát|dừng)\b", raw_app, re.IGNORECASE):
+                sub_parts = [a.strip() for a in re.split(r"\s+(?:tắt|đóng|thoát|dừng|và)\s+", raw_app, flags=re.IGNORECASE) if a.strip()]
+                sub_actions = []
+                for sp in sub_parts:
+                    mapped = self.fuzzy_map.get(sp, sp)
+                    if mapped.lower() in self.SYSTEM_BLACKLIST or f"{mapped.lower()}.exe" in self.SYSTEM_BLACKLIST:
+                        sub_actions.append({"action": "unknown"})
+                    elif mapped:
+                        sub_actions.append({"action": "close_app", "name": mapped})
+                if sub_actions:
+                    return sub_actions
+
+            # Ánh xạ qua fuzzy_map (hỗ trợ cả từ lóng, phiên âm, từ tự học)
             mapped_app = self.fuzzy_map.get(raw_app, raw_app)
-            if mapped_app in self.WHITELIST:
+
+            # Kiểm tra BLACKLIST tiến trình hệ thống nguy hiểm
+            if mapped_app.lower() in self.SYSTEM_BLACKLIST or f"{mapped_app.lower()}.exe" in self.SYSTEM_BLACKLIST:
+                print(f"[Brain: Bảo vệ Hệ thống] Không cho phép tắt tiến trình hệ thống: '{mapped_app}'")
+                return [{"action": "unknown"}]
+
+            # FAST PATH: Trả về action close_app ngay lập tức mà không cần gọi LLM (<0.1s)
+            if mapped_app:
                 return [{"action": "close_app", "name": mapped_app}]
-            else:
-                return None
 
         return None
 
@@ -903,8 +1014,14 @@ Output: {"actions": [{"action": "screenshot"}, {"action": "shutdown"}]}
                 elif act == "close_app":
                     raw_name = str(item.get("name") or item.get("app_name") or "").strip().lower()
                     app_name = self.fuzzy_map.get(raw_name, raw_name)
-                    if app_name not in self.WHITELIST:
-                        print(f"[Brain: Chặn ảo giác LLM] Tên app đóng '{raw_name}' không thuộc WHITELIST -> chuyển thành unknown")
+                    # Gỡ bỏ rào cản Whitelist, chỉ chặn nếu thuộc BLACKLIST tiến trình hệ thống nguy hiểm
+                    if (
+                        app_name.lower() in self.SYSTEM_BLACKLIST
+                        or f"{app_name.lower()}.exe" in self.SYSTEM_BLACKLIST
+                        or raw_name in self.SYSTEM_BLACKLIST
+                        or f"{raw_name}.exe" in self.SYSTEM_BLACKLIST
+                    ):
+                        print(f"[Brain: Bảo vệ Hệ thống] Chặn tắt tiến trình hệ thống nguy hiểm: '{raw_name}' -> chuyển thành unknown")
                         valid_list.append({"action": "unknown"})
                         continue
                     item["name"] = app_name
@@ -1174,7 +1291,9 @@ Output: {"actions": [{"action": "screenshot"}, {"action": "shutdown"}]}
         }
 
         try:
-            response = requests.post(chat_url, json=payload, timeout=self.timeout)
+            # Thiết lập timeout HTTP tối đa 5 giây cho Ollama, tránh nghẽn luồng xử lý
+            http_timeout = min(self.timeout, 5.0) if self.timeout else 5.0
+            response = requests.post(chat_url, json=payload, timeout=http_timeout)
             response.raise_for_status()
             resp_json = response.json()
             content = resp_json.get("message", {}).get("content", "")
@@ -1185,6 +1304,10 @@ Output: {"actions": [{"action": "screenshot"}, {"action": "shutdown"}]}
 
             return actions
 
+        except requests.exceptions.Timeout as exc:
+            # Fallback tức thì khi Ollama xử lý quá 5 giây
+            print(f"[Brain Cảnh báo] Quá thời gian chờ phản hồi từ Ollama sau 5.0s ({exc}). Fallback tức thì về unknown.")
+            return [{"action": "unknown"}]
         except requests.exceptions.RequestException as exc:
             # Fallback an toàn nếu mất kết nối hoặc Ollama bị lỗi
             print(f"[Brain Cảnh báo] Không thể kết nối tới Ollama ({exc}). Fallback an toàn về unknown.")
@@ -1194,17 +1317,90 @@ Output: {"actions": [{"action": "screenshot"}, {"action": "shutdown"}]}
             return [{"action": "unknown"}]
 
     @staticmethod
+    def _is_cache_action_compatible(input_text: str, cached_actions: List[Dict[str, Any]], matched_key: str = "") -> bool:
+        """
+        Kiểm tra xem ĐỘNG TỪ trong câu lệnh đầu vào có tương thích với các action trong Memory Cache hay không.
+        - Nếu câu lệnh chứa 'tăng', 'lên', 'mở', 'bật' -> Tuyệt đối không lấy cache có 'giảm', 'xuống', 'tắt', 'đóng' (và ngược lại).
+        - Tuyệt đối không được lấy kết quả 'open_app' cho câu lệnh 'tắt/đóng' dù độ tương đồng chữ (Fuzzy score) có cao đến đâu.
+        """
+        if not input_text or not cached_actions:
+            return False
+
+        lower_input = input_text.lower()
+        lower_key = matched_key.lower() if matched_key else ""
+
+        # Nhóm từ chiều hướng tích cực / tăng / mở: "tăng", "lên", "mở", "bật"
+        pos_patterns = r"\b(?:tăng|lên|mở|mỡ|bật|vỡ|chạy|khởi\s+động|start|launch|to\s+hơn|sáng\s+hơn)\b"
+        # Nhóm từ chiều hướng tiêu cực / giảm / đóng: "giảm", "xuống", "tắt", "đóng"
+        neg_patterns = r"\b(?:giảm|hạ|xuống|bớt|tắt|đóng|thoát|dừng|kill|exit|quit|close|stop|nhỏ\s+hơn|tối\s+hơn)\b"
+
+        input_has_pos = bool(re.search(pos_patterns, lower_input))
+        input_has_neg = bool(re.search(neg_patterns, lower_input))
+
+        key_has_pos = bool(re.search(pos_patterns, lower_key))
+        key_has_neg = bool(re.search(neg_patterns, lower_key))
+
+        # Kiểm tra direction trong actions (up vs down)
+        cached_directions = [a.get("direction") for a in cached_actions if isinstance(a, dict) and "direction" in a]
+        has_dir_up = "up" in cached_directions
+        has_dir_down = "down" in cached_directions
+
+        # Kiểm tra state trong actions (on vs off)
+        cached_states = [str(a.get("state")).lower() for a in cached_actions if isinstance(a, dict) and "state" in a]
+        has_state_on = any(s in ("on", "enable", "bật") for s in cached_states)
+        has_state_off = any(s in ("off", "disable", "tắt") for s in cached_states)
+
+        action_types = [a.get("action") for a in cached_actions if isinstance(a, dict)]
+
+        # TH1: Câu lệnh hiện tại chứa "tăng", "lên", "mở", "bật" (không chứa chiều ngược lại)
+        # Tuyệt đối không lấy cache có "giảm", "xuống", "tắt", "đóng", direction=down, state=off, close_app, shutdown
+        if input_has_pos and not input_has_neg:
+            if key_has_neg or has_dir_down or has_state_off or "close_app" in action_types or "shutdown" in action_types:
+                return False
+
+        # TH2: Câu lệnh hiện tại chứa "giảm", "xuống", "tắt", "đóng" (không chứa chiều ngược lại)
+        # Tuyệt đối không lấy cache có "tăng", "lên", "mở", "bật", direction=up, state=on, open_app, open_explorer...
+        if input_has_neg and not input_has_pos:
+            if key_has_pos or has_dir_up or has_state_on or "open_app" in action_types or any(act in ("open_explorer", "open_folder", "open_drive") for act in action_types):
+                return False
+
+        # TH3: Phân biệt rõ Độ sáng (brightness) vs Âm lượng (volume)
+        input_has_bright = bool(re.search(r"\b(?:độ\s*sáng|ánh\s*sáng|sáng|màn\s*hình\s*sáng)\b", lower_input))
+        input_has_vol = bool(re.search(r"\b(?:âm\s*lượng|âm\s*thanh|tiếng|volume)\b", lower_input))
+        if input_has_bright and not input_has_vol:
+            if "volume" in action_types:
+                return False
+        if input_has_vol and not input_has_bright:
+            if "brightness" in action_types:
+                return False
+
+        return True
+
+    @staticmethod
     def _is_valid_actions(actions: Any) -> bool:
         """
         Kiểm tra danh sách actions có hợp lệ để lưu vào bộ nhớ không.
-        Không lưu nếu rỗng hoặc toàn bộ là unknown.
+        Không lưu nếu rỗng hoặc toàn bộ là unknown, hoặc tên app dính lỗi ghép chưa tách.
         """
         if not actions or not isinstance(actions, list):
             return False
-        return any(
-            isinstance(act, dict) and act.get("action") not in (None, "unknown")
-            for act in actions
-        )
+        has_valid = False
+        for act in actions:
+            if not isinstance(act, dict):
+                continue
+            act_type = act.get("action")
+            if act_type in (None, "unknown"):
+                continue
+            # Chống lưu vào memory cache các action open_app / close_app bị dính chuỗi ghép lỗi
+            if act_type in ("open_app", "close_app"):
+                app_n = str(act.get("name", "")).lower()
+                if any(w in app_n for w in (" mở ", " mỡ ", " bật ", " tắt ", " đóng ", " và ")):
+                    return False
+            # CẤM LƯU VÀO CACHE: Lệnh đo lường/số cụ thể (âm lượng/độ sáng chứa percentage hoặc step)
+            if act_type in ("volume", "brightness") and ("percentage" in act or "step" in act):
+                return False
+            has_valid = True
+        return has_valid
 
     def _match_phonetic_rapid(self, text: str) -> Optional[List[Dict[str, Any]]]:
         """
@@ -1273,21 +1469,40 @@ Output: {"actions": [{"action": "screenshot"}, {"action": "shutdown"}]}
         # =====================================================================
         # BƯỚC 0: KIỂM TRA BỘ NHỚ ĐỆM (MEMORY CACHE)
         # =====================================================================
-        # TUYỆT ĐỐI KHÔNG sử dụng Memory Cache nếu độ dài câu nói < 3 từ (ví dụ: "mở ổ", "mở do")
-        # để chống khớp sai lệch ngữ cảnh. Phải đưa qua Fast Path hoặc LLM để xử lý chính xác.
         words = input_text.split()
-        if len(words) < 3:
+        has_number_or_percent = bool(
+            re.search(r"\d+|%", input_text)
+            or re.search(r"\b(?:không|một|hai|ba|bốn|năm|sáu|bảy|tám|chín|mười|mươi|lăm|trăm|phần\s*trăm)\b", input_text.lower())
+        )
+        is_vol_or_bright = bool(
+            re.search(r"\b(?:độ\s*sáng|ánh\s*sáng|sáng|âm\s*lượng|âm\s*thanh|tiếng|volume|brightness)\b", input_text.lower())
+        )
+        is_measurement_cmd = has_number_or_percent and is_vol_or_bright
+
+        # TUYỆT ĐỐI KHÔNG sử dụng Memory Cache cho các câu lệnh chứa số/đo lường
+        # hoặc nếu độ dài câu nói < 3 từ (ví dụ: "mở ổ", "mở do")
+        # để chống khớp sai lệch ngữ cảnh. Phải đưa qua Fast Path hoặc LLM để xử lý chính xác.
+        if is_measurement_cmd:
+            print(f"[Brain: CẤM DÙNG Memory Cache] Lệnh chứa số đo/phần trăm ('{input_text}') -> Bắt buộc chạy Fast Path (Regex)!")
+        elif len(words) < 3:
             print(f"[Brain: Bỏ qua Memory Cache] Câu nói quá ngắn ({len(words)} từ < 3 từ: '{input_text}') -> Chuyển thẳng tới Fast Path / LLM.")
         else:
             cached_result = self.memory.get(input_text)
             if cached_result is not None:
                 cached_actions, matched_key, score = cached_result
-                if score >= 0.999:
-                    print(f"[Brain: MEMORY CACHE] Lấy từ bộ nhớ -> <1ms -> {cached_actions}")
+                # Kiểm tra ĐỘNG TỪ có tương thích không (Mở vs Tắt)
+                if not self._is_cache_action_compatible(input_text, cached_actions, matched_key):
+                    print(
+                        f"[Brain: MEMORY CACHE BÁC BỎ] Xung đột động từ giữa câu lệnh '{input_text}' "
+                        f"và cache '{matched_key}' ({cached_actions}) -> Bỏ qua bộ nhớ, chạy lại Fast Path!"
+                    )
                 else:
-                    pct = round(score * 100, 1)
-                    print(f"[Brain: MEMORY CACHE (Fuzzy {pct}%)] Khớp với '{matched_key}' -> Lấy từ bộ nhớ (<1ms) -> {cached_actions}")
-                return cached_actions
+                    if score >= 0.999:
+                        print(f"[Brain: MEMORY CACHE] Lấy từ bộ nhớ -> <1ms -> {cached_actions}")
+                    else:
+                        pct = round(score * 100, 1)
+                        print(f"[Brain: MEMORY CACHE (Fuzzy {pct}%)] Khớp với '{matched_key}' -> Lấy từ bộ nhớ (<1ms) -> {cached_actions}")
+                    return cached_actions
 
         # =====================================================================
         # BƯỚC 1: FAST PATH (Regex)
@@ -1295,7 +1510,7 @@ Output: {"actions": [{"action": "screenshot"}, {"action": "shutdown"}]}
         fast_actions = self._fast_path(input_text)
         if fast_actions is not None:
             print(f"[Brain: FAST PATH (Regex)] Khớp lệnh nhanh -> {fast_actions}")
-            if self._is_valid_actions(fast_actions) and len(words) >= 3:
+            if self._is_valid_actions(fast_actions) and len(words) >= 3 and not is_measurement_cmd:
                 self.memory.set(input_text, fast_actions)
                 print(f"[Brain: MEMORY CACHE] Đã ghi nhớ câu lệnh: '{input_text}'")
             return fast_actions
@@ -1306,7 +1521,7 @@ Output: {"actions": [{"action": "screenshot"}, {"action": "shutdown"}]}
         phonetic_actions = self._match_phonetic_rapid(input_text)
         if phonetic_actions is not None:
             print(f"[Brain: RAPIDFUZZ (>80%)] Khớp phiên âm tiếng Anh -> {phonetic_actions}")
-            if self._is_valid_actions(phonetic_actions) and len(words) >= 2:
+            if self._is_valid_actions(phonetic_actions) and len(words) >= 2 and not is_measurement_cmd:
                 self.memory.set(input_text, phonetic_actions)
                 print(f"[Brain: MEMORY CACHE] Đã ghi nhớ câu lệnh: '{input_text}'")
             return phonetic_actions
@@ -1320,7 +1535,7 @@ Output: {"actions": [{"action": "screenshot"}, {"action": "shutdown"}]}
         duration = round(time.time() - t0, 2)
         print(f"[Brain: SLOW PATH (LLM)] Hoàn thành trong {duration}s -> {slow_actions}")
 
-        if self._is_valid_actions(slow_actions) and len(words) >= 3:
+        if self._is_valid_actions(slow_actions) and len(words) >= 3 and not is_measurement_cmd:
             self.memory.set(input_text, slow_actions)
             print(f"[Brain: MEMORY CACHE] Đã ghi nhớ câu lệnh: '{input_text}'")
 

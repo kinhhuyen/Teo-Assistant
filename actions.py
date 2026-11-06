@@ -22,7 +22,7 @@ import urllib.parse
 import webbrowser
 import winreg
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 # Đảm bảo in tiếng Việt có dấu không bị lỗi UnicodeEncodeError trên Console Windows
 if sys.platform.startswith("win"):
@@ -137,6 +137,47 @@ class ActionExecutor:
         "revo": "RevoUninPro.exe",
     }
 
+    # Bảng ánh xạ tên gọi thông thường sang tên tiến trình Windows (.exe) phục vụ tắt app thông minh
+    PROCESS_NAME_MAP: Dict[str, Union[str, List[str]]] = {
+        "powerpoint": "POWERPNT.EXE",
+        "power point": "POWERPNT.EXE",
+        "microsoft powerpoint": "POWERPNT.EXE",
+        "word": "WINWORD.EXE",
+        "winword": "WINWORD.EXE",
+        "microsoft word": "WINWORD.EXE",
+        "excel": "EXCEL.EXE",
+        "microsoft excel": "EXCEL.EXE",
+        "chrome": "chrome.exe",
+        "google chrome": "chrome.exe",
+        "zalo": "Zalo.exe",
+        "notepad": "notepad.exe",
+        "ghi chú": "notepad.exe",
+        "cốc cốc": "browser.exe",
+        "coccoc": "browser.exe",
+        "edge": "msedge.exe",
+        "microsoft edge": "msedge.exe",
+        "microsoft store": ["winstore.app.exe", "microsoft.windowsstore", "winstore.app"],
+        "store": ["winstore.app.exe", "microsoft.windowsstore", "winstore.app"],
+        "chợ ứng dụng": ["winstore.app.exe", "microsoft.windowsstore", "winstore.app"],
+        "máy tính": ["CalculatorApp.exe", "calc.exe"],
+        "calc": ["CalculatorApp.exe", "calc.exe"],
+        "calculator": ["CalculatorApp.exe", "calc.exe"],
+        "spotify": "Spotify.exe",
+        "telegram": "Telegram.exe",
+        "discord": "Discord.exe",
+        "cmd": "cmd.exe",
+        "terminal": "cmd.exe",
+        "command prompt": "cmd.exe",
+        "paint": "mspaint.exe",
+        "mspaint": "mspaint.exe",
+        "github": "GitHubDesktop.exe",
+        "antigravity": "Antigravity IDE.exe",
+        "revo uninstaller": ["RevoUninPro.exe", "RevoUnin.exe"],
+        "revo": ["RevoUninPro.exe", "RevoUnin.exe"],
+        "tiktok": "tiktok.exe",
+        "capcut": "capcut.exe",
+    }
+
     # Bảng đường dẫn tuyệt đối mặc định cho các app phổ biến khi không nằm trong PATH
     DEFAULT_APP_PATHS: Dict[str, str] = {
         "zalo": os.path.expandvars(r"%LOCALAPPDATA%\Programs\Zalo\Zalo.exe"),
@@ -239,6 +280,11 @@ class ActionExecutor:
                 r"Microsoft Office\root\Office16\EXCEL.EXE",
                 r"Microsoft Office\Office16\EXCEL.EXE",
                 r"Microsoft Office\Office15\EXCEL.EXE",
+            ],
+            "powerpoint": [
+                r"Microsoft Office\root\Office16\POWERPNT.EXE",
+                r"Microsoft Office\Office16\POWERPNT.EXE",
+                r"Microsoft Office\Office15\POWERPNT.EXE",
             ],
             "coccoc": [
                 r"CocCoc\Browser\Application\browser.exe",
@@ -391,28 +437,49 @@ class ActionExecutor:
                 print(f"[Action] [!] Lỗi khi mở từ candidate path '{candidate_path}': {exc}")
 
         # =========================================================================
-        # BƯỚC 3: DỰ PHÒNG APPOPENER (cho app UWP / Store - match_closest=False)
+        # BƯỚC 3: DỰ PHÒNG APPOPENER (Bọc try/except toàn diện chống UnicodeDecodeError)
         # =========================================================================
-        ao = get_app_opener()
-        if ao is not None:
-            try:
-                available_apps = ao.give_appnames()
-                exact_app_name = None
-                for app_key in available_apps:
-                    if app_key.strip().lower() == name:
-                        exact_app_name = app_key
-                        break
+        app_opener_failed = False
+        try:
+            ao = get_app_opener()
+            if ao is not None:
+                try:
+                    available_apps = ao.give_appnames()
+                    exact_app_name = None
+                    if isinstance(available_apps, (list, dict, set)):
+                        for app_key in available_apps:
+                            if str(app_key).strip().lower() == name:
+                                exact_app_name = str(app_key)
+                                break
 
-                if exact_app_name:
-                    ao.open(exact_app_name, match_closest=False, throw_error=True)
-                    print(f"[Action] [✓] Đã mở thành công '{exact_app_name}' qua AppOpener.")
-                    return
-                else:
-                    ao.open(name, match_closest=False, throw_error=True)
-                    print(f"[Action] [✓] Đã mở thành công '{name}' qua AppOpener.")
-                    return
-            except Exception as exc:
-                print(f"[Action] [!] AppOpener không mở được '{name}': {exc}")
+                    if exact_app_name:
+                        ao.open(exact_app_name, match_closest=False, throw_error=True)
+                        print(f"[Action] [✓] Đã mở thành công '{exact_app_name}' qua AppOpener.")
+                        return
+                    else:
+                        ao.open(name, match_closest=False, throw_error=True)
+                        print(f"[Action] [✓] Đã mở thành công '{name}' qua AppOpener.")
+                        return
+                except (UnicodeDecodeError, Exception) as exc:
+                    print(f"[Action] [!] AppOpener lỗi khi mở '{name}': {exc}. Fallback sang lệnh 'start' của Windows...")
+                    app_opener_failed = True
+        except BaseException as exc:
+            print(f"[Action Cảnh báo] AppOpener gặp sự cố ({exc}). Chuyển sang fallback...")
+            app_opener_failed = True
+
+        # Nếu AppOpener lỗi, lập tức fallback sang lệnh start của Windows
+        if app_opener_failed:
+            try:
+                subprocess.Popen(
+                    f'start "" "{name}"',
+                    shell=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                print(f"[Action] [✓] Đã kích hoạt fallback lệnh start cho '{name}'.")
+            except Exception as e:
+                print(f"[Action Cảnh báo] Lỗi chạy fallback start cho '{name}': {e}")
 
         # =========================================================================
         # BƯỚC 4: THỬ QUA PATH HỆ THỐNG
@@ -486,29 +553,140 @@ class ActionExecutor:
             print(f"[Action Cảnh báo] Lỗi kiểm tra tiến trình psutil: {exc}")
         return False
 
+    def close_app(self, app_name: str) -> str:
+        """
+        Tìm và tắt ứng dụng theo tên một cách thông minh bằng psutil.
+
+        Args:
+            app_name: Tên ứng dụng (ví dụ: 'powerpoint', 'word', 'excel', 'chrome', 'zalo'...).
+
+        Returns:
+            Thông báo 'Đã tắt [tên app]' nếu thành công, hoặc 'App không chạy' nếu không tìm thấy.
+        """
+        cleaned_name = app_name.strip().lower()
+        if not cleaned_name:
+            return "Không có tên ứng dụng cần đóng."
+
+        # 1. Lấy tên process tương ứng từ từ điển (nếu không có, dùng luôn tên người dùng nói)
+        target_entry = self.PROCESS_NAME_MAP.get(cleaned_name, cleaned_name)
+        if isinstance(target_entry, list):
+            target_proc_names = [p.lower() for p in target_entry]
+        else:
+            target_proc_names = [str(target_entry).lower()]
+
+        # Chuẩn hóa danh sách tên tiến trình cần so khớp (cả có và không có đuôi .exe)
+        match_targets = set()
+        for t in target_proc_names:
+            match_targets.add(t)
+            if not t.endswith(".exe"):
+                match_targets.add(f"{t}.exe")
+            else:
+                match_targets.add(t[:-4])
+
+        print(f"[Action] Đang tìm và tắt ứng dụng: '{app_name}' (Target processes: {match_targets})...")
+
+        # 2. Duyệt qua tất cả process đang chạy bằng psutil.process_iter(['name'])
+        killed_count = 0
+        search_names = set()
+        for t in target_proc_names:
+            t_base = t.lower().replace(".exe", "").strip()
+            search_names.add(t_base)
+            if "winstore" in t_base:
+                search_names.add("winstore")
+            if "calculator" in t_base:
+                search_names.add("calculator")
+
+        if psutil is not None:
+            try:
+                for proc in psutil.process_iter(['name', 'pid']):
+                    try:
+                        pname = (proc.info.get('name') or '').lower()
+                        pbase = pname[:-4] if pname.endswith(".exe") else pname
+
+                        # 3. So khớp chính xác hoặc mở rộng tìm kiếm: target_name in proc_name.lower()
+                        matched = False
+                        if pname in match_targets or pbase in match_targets:
+                            matched = True
+                        else:
+                            for s in search_names:
+                                if len(s) >= 4 and (s in pname or s in pbase):
+                                    matched = True
+                                    break
+
+                        if matched:
+                            proc.kill()
+                            killed_count += 1
+                    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                        continue
+            except Exception as exc:
+                print(f"[Action Cảnh báo] Lỗi khi duyệt tiến trình qua psutil: {exc}")
+
+        # 3b. Xử lý chuyên biệt cho App UWP (Microsoft Store, Calculator, v.v.) bằng lệnh PowerShell
+        uwp_candidates = []
+        if any(w in cleaned_name for w in ["store", "chợ ứng dụng", "winstore"]):
+            uwp_candidates.extend(["WinStore.App", "StoreDesktopExtension"])
+        if any(w in cleaned_name for w in ["calc", "máy tính", "calculator"]):
+            uwp_candidates.append("CalculatorApp")
+        for t in target_proc_names:
+            if "winstore" in t:
+                uwp_candidates.append("WinStore.App")
+            if "calculator" in t:
+                uwp_candidates.append("CalculatorApp")
+
+        for uwp in set(uwp_candidates):
+            try:
+                ps_cmd = f"Get-Process -Name {uwp} -ErrorAction Stop | Stop-Process -Force"
+                res = subprocess.run(
+                    ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=3.0,
+                )
+                if res.returncode == 0:
+                    killed_count += 1
+            except Exception as exc:
+                print(f"[Action Cảnh báo] Lỗi khi tắt UWP app '{uwp}' qua PowerShell: {exc}")
+
+        # Dự phòng bằng taskkill nếu psutil và PowerShell chưa kill được (hoặc cần quyền hệ thống)
+        if killed_count == 0:
+            for t in target_proc_names:
+                exe = t if t.endswith(".exe") else f"{t}.exe"
+                try:
+                    res = subprocess.run(
+                        ["taskkill", "/IM", exe, "/F"],
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    if res.returncode == 0:
+                        killed_count += 1
+                except Exception:
+                    pass
+
+        # 4. Trả về thông báo
+        if killed_count > 0:
+            msg = f"Đã tắt {app_name}"
+            print(f"[Action] [✓] {msg} (Đã đóng {killed_count} tiến trình)")
+            return msg
+        else:
+            msg = "App không chạy"
+            print(f"[Action] [!] {msg} ('{app_name}')")
+            return msg
+
     def _handle_close_app(self, action: Dict[str, Any]) -> None:
         """
-        Xử lý đóng/tắt ứng dụng bằng lệnh taskkill.
+        Xử lý đóng/tắt ứng dụng bằng psutil thông minh.
         """
-        name = action.get("name", "").strip().lower()
+        name = action.get("name", "").strip()
         if not name:
             raise ValueError("Không có tên ứng dụng cần đóng.")
 
-        exe_name = self.APP_MAP.get(name, name)
-        if not exe_name.endswith(".exe"):
-            exe_name = f"{exe_name}.exe"
-
-        print(f"[Action] Đang đóng ứng dụng: '{name}' ({exe_name})...")
-        try:
-            subprocess.run(
-                ["taskkill", "/IM", exe_name, "/F"],
-                creationflags=subprocess.CREATE_NO_WINDOW,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            print(f"[Action] [✓] Đã đóng ứng dụng: {name}")
-        except Exception as exc:
-            print(f"[Action] [!] Lỗi khi đóng ứng dụng {name}: {exc}")
+        result_msg = self.close_app(name)
+        if "Đã tắt" in result_msg:
+            print(f"[Action] [✓] {result_msg}")
+        else:
+            print(f"[Action] [!] {result_msg}: '{name}'")
 
     def _handle_search_web(self, action: Dict[str, Any]) -> None:
         """

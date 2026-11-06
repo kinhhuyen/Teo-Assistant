@@ -10,6 +10,7 @@ Công nghệ:
     4. Offline Fallback: Khi mất mạng, tự động đưa audio cho Vosk xử lý và áp dụng từ điển tự học.
 """
 
+import concurrent.futures
 import json
 import os
 import queue
@@ -95,20 +96,11 @@ class SpeechToText:
         if HAS_VOSK:
             try:
                 vosk.SetLogLevel(-1)  # Tắt log Kaldi rườm rà
-                from utils import resource_path
-                cache_dir = Path(os.path.expanduser("~/.cache/vosk/vosk-model-small-vn-0.4"))
-                local_dir = Path(resource_path("model"))
-
-                if vosk_model_path and Path(vosk_model_path).exists():
-                    self.vosk_model = vosk.Model(str(vosk_model_path))
-                elif local_dir.exists():
-                    self.vosk_model = vosk.Model(str(local_dir))
-                elif cache_dir.exists():
-                    self.vosk_model = vosk.Model(str(cache_dir))
-                else:
-                    self.vosk_model = vosk.Model(lang="vn")
-
-                print("[STT] ✓ Đã nạp thành công mô hình Vosk Offline tiếng Việt.")
+                from utils import get_vosk_model_path
+                resolved_model_path = get_vosk_model_path(vosk_model_path)
+                self.vosk_model = vosk.Model(resolved_model_path)
+                model_name = Path(resolved_model_path).name
+                print(f"[STT] ✓ Đã nạp thành công mô hình Vosk tiếng Việt: '{model_name}'.")
             except Exception as exc:
                 print(f"[STT Cảnh báo] Không thể khởi tạo mô hình Vosk: {exc}")
                 self.vosk_model = None
@@ -201,24 +193,32 @@ class SpeechToText:
         except Exception:
             return False
 
-    def recognize_google(self, raw_audio: bytes) -> str:
+    def recognize_google(self, raw_audio: bytes, timeout: float = 2.0) -> str:
         """
         Gửi audio cho Google STT để nhận diện giọng nói trực tuyến.
-        Trả về chuỗi văn bản nhận diện được.
+        Giới hạn thời gian chờ tối đa 2.0 giây. Nếu quá 2s hoặc mất mạng, ném TimeoutError/ConnectionError
+        để lập tức fallback sang Vosk Offline mà không làm treo hệ thống.
         """
         if not self.recognizer or not raw_audio:
             return ""
 
         audio_data = sr.AudioData(raw_audio, self.SAMPLE_RATE, 2)
-        try:
-            # Nhận diện với Google Speech Recognition API
-            text = self.recognizer.recognize_google(audio_data, language=self.language)
-            return text.strip() if text else ""
-        except sr.UnknownValueError:
-            # Không phát hiện giọng nói rõ ràng
-            return ""
-        except sr.RequestError as exc:
-            raise ConnectionError(f"Google STT Service không khả dụng: {exc}") from exc
+
+        def _call_api():
+            return self.recognizer.recognize_google(audio_data, language=self.language)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_call_api)
+            try:
+                text = future.result(timeout=timeout)
+                return text.strip() if text else ""
+            except concurrent.futures.TimeoutError:
+                raise TimeoutError(f"Google STT phản hồi quá {timeout}s.")
+            except sr.UnknownValueError:
+                # Không phát hiện giọng nói rõ ràng
+                return ""
+            except sr.RequestError as exc:
+                raise ConnectionError(f"Google STT Service không khả dụng: {exc}") from exc
 
     def recognize_vosk(self, raw_audio: bytes) -> str:
         """
@@ -371,12 +371,13 @@ class SpeechToText:
         sd.wait()
         return data.tobytes()
 
-    def record_wake_command(self, max_duration: float = 4.5, silence_limit: float = 0.9) -> bytes:
+    def record_wake_command(self, max_duration: float = 6.0, silence_limit: float = 1.5) -> bytes:
         """
         Thu âm thông minh sau khi đánh thức bằng Wake Word:
         - Lắng nghe khi người dùng bắt đầu nói.
-        - Tự động ngắt khi phát hiện im lặng (silence_limit ~0.9s) sau khi đã nói xong.
-        - Tối đa max_duration (4.5s) để tránh treo nếu môi trường có tiếng ồn nền.
+        - Tự động ngắt khi phát hiện khoảng lặng (silence_limit = 1.5s) sau khi đã nói xong.
+        - Cho phép người dùng ngập ngừng lấy hơi 1.0s mà không bị cắt ngang câu lệnh.
+        - Tối đa max_duration (6.0s) để tránh treo nếu môi trường có tiếng ồn nền.
         """
         self.check_microphone()
         chunk_size = self.CHUNK_SIZE
@@ -384,9 +385,9 @@ class SpeechToText:
         speech_started = False
         silence_start = None
         start_time = time.time()
-        speech_energy_threshold = 400.0  # RMS threshold cho giọng nói người
+        speech_energy_threshold = 350.0  # RMS threshold cho giọng nói người (nói bình thường là nhận)
 
-        print(f"[STT 🎙️] Đang lắng nghe câu lệnh (tối đa {max_duration}s)...")
+        print("[STT] Đang nghe...")
         try:
             with sd.InputStream(samplerate=self.SAMPLE_RATE, channels=self.CHANNELS, dtype="int16", blocksize=chunk_size, device=self.input_device) as stream:
                 while (time.time() - start_time) < max_duration:
@@ -402,11 +403,12 @@ class SpeechToText:
                         if silence_start is None:
                             silence_start = time.time()
                         elif (time.time() - silence_start) >= silence_limit:
-                            # Người dùng đã nói xong và im lặng 0.9s -> Ngắt sớm!
+                            # Người dùng đã nói xong và phát hiện khoảng lặng 1.5s -> Kết thúc ghi âm
+                            print(f"[STT] Phát hiện khoảng lặng {silence_limit:.1f}s, kết thúc ghi âm.")
                             break
                     else:
-                        # Chưa bắt đầu nói: nếu quá 2.8s không có tiếng động -> dừng sớm
-                        if (time.time() - start_time) > 2.8:
+                        # Chưa bắt đầu nói: nếu quá 3.5s không có tiếng động -> dừng sớm
+                        if (time.time() - start_time) > 3.5:
                             break
         except Exception as exc:
             print(f"[STT Cảnh báo record_wake_command]: {exc}")
@@ -467,8 +469,8 @@ class SpeechToText:
                 # TRẢ VỀ KẾT QUẢ NGAY LẬP TỨC CHO BỘ NÃO XỬ LÝ (TỐC ĐỘ < 1s)
                 return clean_google
 
-            except ConnectionError as conn_err:
-                print(f"[STT Cảnh báo] Mất kết nối Google STT ({conn_err}). Chuyển sang Vosk Offline...")
+            except (TimeoutError, ConnectionError) as conn_err:
+                print(f"[STT Cảnh báo] Google STT quá 2s hoặc mất kết nối ({conn_err}). Lập tức chuyển sang Vosk Offline...")
                 # Rơi xuống xử lý Offline bên dưới
             except Exception as exc:
                 print(f"[STT Cảnh báo] Google STT gặp sự cố ({exc}). Chuyển sang Vosk Offline...")

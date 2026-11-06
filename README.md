@@ -65,6 +65,14 @@
 - Cửa sổ không viền (**Frameless**), luôn nổi trên cùng (**Always on Top**), nền trong suốt (**Translucent**).
 - Vòng tròn phát sáng gradient Cyan/Blue huyền ảo kèm nhịp thở 60 FPS và dòng trạng thái động (*"Tèo đang lắng nghe..."*, *"Đang thực thi lệnh..."*).
 
+### 10. 🛡️ Tính năng bảo mật (Tùy chọn): Đăng ký giọng nói để chỉ mình bạn có thể đánh thức Tèo
+- **Sinh trắc học giọng nói ngoại tuyến (Resemblyzer Voice Auth - Offline 100%):** 
+  - Trích xuất vector đặc trưng 256 chiều của chủ nhân từ khẩu lệnh *"Tèo đâu"* qua 5 lần ghi âm mẫu, lưu trữ trong file bảo mật `my_voice.pkl` (được bảo vệ bởi `.gitignore`).
+  - Mỗi khi phát hiện từ khóa, hệ thống tính toán Cosine Similarity tức thì (<10ms). Nếu không phải giọng chủ nhân (`cosine < 0.75`), hệ thống **hủy bỏ và im lặng ngay lập tức**, triệt tiêu 99% hiện tượng kích hoạt ảo từ tiếng ồn, tiếng TV hoặc người lạ nói chuyện xung quanh.
+- **Cơ chế Tùy chọn (First-run Friendly):** 
+  - Người dùng mới chưa đăng ký giọng nói (`my_voice.pkl` chưa tồn tại) vẫn sử dụng được bình thường mà không bị chặn.
+  - Khi muốn bảo mật cá nhân, chỉ cần nhấp chuột phải vào icon khay hệ thống (System Tray) và chọn: **`🎙️ Đăng ký / Cập nhật Giọng nói (Voice ID)`** (hoặc chạy lệnh `python record_my_voice.py`).
+
 ---
 
 ## 📂 Cấu trúc thư mục dự án
@@ -72,27 +80,30 @@
 ```text
 VoicePilot/
 │
-├── app_tray.py               # [Entry Point] Khay hệ thống, Autostart, Menu Micro, điều phối toàn bộ app
+├── app_tray.py               # [Entry Point] Khay hệ thống, Autostart, Menu Micro & Voice ID
 ├── ui_overlay.py             # Giao diện Glow Orb phát sáng bằng PyQt6 (Frameless, Always on Top)
-├── wake_word_engine.py       # Bộ lắng nghe Wake Word ("Hey Tèo") bằng Vosk Offline Grammar & chọn Micro
-├── stt_engine.py             # Module nhận diện giọng nói Hybrid (Google STT + Vosk Offline) & chọn Micro
-├── brain.py                  # Bộ não Hybrid (Fast Path Regex < 0.1s, Cache, Slow Path routing)
-├── actions.py                # Bộ thực thi hành động hệ thống (Registry, Windows start shell, Volume...)
+├── wake_word_engine.py       # Bộ lắng nghe Wake Word ("Tèo đâu") bằng Vosk Medium & Voice Auth Resemblyzer
+├── voice_auth.py             # Module xác thực sinh trắc học giọng nói ngoại tuyến (Offline 100%)
+├── record_my_voice.py        # Script ghi âm 5 lần khẩu lệnh tạo profile my_voice.pkl
+├── stt_engine.py             # Module nhận diện giọng nói Hybrid (Google STT timeout 2s + Vosk Offline)
+├── brain.py                  # Bộ não Hybrid (Fast Path Regex < 0.1s, Memory Cache, Slow Path LLM)
+├── actions.py                # Bộ thực thi hành động hệ thống (Registry, Windows start shell, Volume, Brightness...)
 ├── memory_manager.py         # Quản lý bộ nhớ đệm lệnh và tự phục hồi khi JSON hỏng (Auto-Recovery)
 ├── auto_learn.py             # Bộ tự học offline 3 tầng validation, chuẩn hóa phiên âm
 ├── utils.py                  # Đường dẫn động, ghi log xoay vòng, Registry Autostart & Quản lý Micro
 │
+├── my_voice.pkl              # Hồ sơ đặc trưng giọng nói chủ nhân (Tùy chọn, bảo mật cá nhân)
 ├── model/                    # Thư mục mô hình Vosk Offline tiếng Việt (vosk-model-small-vn)
+├── vosk-model-vn-0.22/       # Mô hình Vosk Medium tiếng Việt chất lượng cao (~1.5GB, tùy chọn)
 ├── config.json               # Cấu hình Micro và tùy chọn cá nhân
 ├── memory.json               # Cơ sở dữ liệu bộ nhớ đệm câu lệnh (Memory Cache)
 ├── learned_phonetics.json    # Từ điển tự học từ lóng / phiên âm tên ứng dụng
 ├── offline_learning.json     # Từ điển tự học ánh xạ âm thanh Vosk -> Lệnh chuẩn
 ├── teo_debug.log             # Nhật ký hoạt động chi tiết thời gian thực
 │
-├── TeoAssistant.spec         # File cấu hình đóng gói PyInstaller chuyên dụng v1.3.1
-├── requirements.txt          # Danh sách thư viện Python cần thiết
-├── test_hybrid_system.py     # Suite kiểm thử tự động toàn diện STT, Brain, Actions
-└── test_phase5_wake_overlay.py # Suite kiểm thử tự động Wake Word Vosk Grammar & Overlay
+├── TeoAssistant.spec         # File cấu hình đóng gói PyInstaller chuyên dụng
+├── requirements.txt          # Danh sách thư viện Python cần thiết (kèm Resemblyzer, Librosa)
+└── tests/                    # Thư mục kiểm thử tự động toàn diện
 ```
 
 ---

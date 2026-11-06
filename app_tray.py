@@ -1,6 +1,6 @@
 """
 Module: app_tray.py
-Mục đích: Chương trình điều phối chính của Trợ lý ảo Tèo Assistant (v1.3).
+Mục đích: Chương trình điều phối chính của Trợ lý ảo Tèo Assistant (v1.2.0).
 Chức năng:
     - Quản lý giao diện PyQt6 trên luồng chính (Main Thread):
         + Cửa sổ Glow Orb Overlay trong suốt, mờ ảo chính giữa màn hình.
@@ -8,7 +8,7 @@ Chức năng:
         + Tự động khởi động cùng Windows (Autostart qua Registry HKCU Run).
         + Lựa chọn và thay đổi Microphone trực tiếp từ menu Tray, lưu cấu hình vào `config.json`.
         + Ghi log xoay vòng ra tệp `teo_debug.log` để bắt bệnh và debug từ xa khi ẩn CMD console.
-    - Chạy bộ nhận diện Wake Word "Hey Tèo" (Vosk tiếng Việt) và pipeline xử lý lệnh trên các luồng phụ.
+    - Chạy bộ nhận diện Wake Word "Tèo đâu" (Vosk tiếng Việt) và pipeline xử lý lệnh trên các luồng phụ.
 """
 
 import concurrent.futures
@@ -103,6 +103,21 @@ def ensure_single_instance() -> bool:
 
 # Kiểm tra nhanh tại entry point TRƯỚC KHI import PyQt6 hay Vosk
 if __name__ == "__main__":
+    if "--record-voice" in sys.argv:
+        if sys.platform.startswith("win"):
+            try:
+                import ctypes
+                if not ctypes.windll.kernel32.AttachConsole(-1):
+                    ctypes.windll.kernel32.AllocConsole()
+                sys.stdout = open("CONOUT$", "w", encoding="utf-8")
+                sys.stderr = open("CONOUT$", "w", encoding="utf-8")
+                sys.stdin = open("CONIN$", "r", encoding="utf-8")
+            except Exception:
+                pass
+        from record_my_voice import main as record_voice_main
+        record_voice_main()
+        sys.exit(0)
+
     if not ensure_single_instance():
         try:
             print("Tèo Assistant đang chạy ngầm!", flush=True)
@@ -122,7 +137,7 @@ from PyQt6.QtGui import (
     QPainter,
     QPixmap,
 )
-from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
+from PyQt6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 
 from actions import ActionExecutor
 from brain import Brain
@@ -196,6 +211,13 @@ class CommandProcessingWorker(QThread):
         self.executor = executor
         self.wake_engine = wake_engine
         self._is_busy = False
+        self.last_activity_time = time.time()
+
+    def ping_activity(self, message: str = "") -> None:
+        """Cập nhật mốc thời gian hoạt động gần nhất để Watchdog biết hệ thống vẫn đang xử lý bình thường."""
+        self.last_activity_time = time.time()
+        if message:
+            print(f"[Worker Activity] {message}", flush=True)
 
     def trigger_command(self, wake_word_name: str = "teo") -> None:
         """Kích hoạt chạy luồng xử lý lệnh nếu chưa bận."""
@@ -205,19 +227,61 @@ class CommandProcessingWorker(QThread):
         self.start()
 
     def run(self) -> None:
-        """Thực thi toàn bộ pipeline nhận diện và chạy hành động với cơ chế Timeout 5s."""
+        """
+        Thực thi toàn bộ pipeline nhận diện và chạy hành động.
+        Cơ chế giám sát thông minh Watchdog 15 giây (chống treo cứng):
+        - Cập nhật liên tục self.last_activity_time mỗi khi STT, Brain hoặc Action có tiến triển.
+        - Luồng Watchdog kiểm tra định kỳ 1s: chỉ khi hệ thống bị treo hoàn toàn > 15s không có hoạt động
+          mới can thiệp kill tiến trình và reset micro.
+        - Nếu đang xử lý bình thường (có log/tiến triển), Watchdog để tác vụ chạy đến khi xong.
+        """
         self._is_busy = True
+        self.ping_activity("Khởi động chu trình xử lý lệnh")
+
+        stop_watchdog = threading.Event()
+        pipeline_finished = threading.Event()
+        is_hung = threading.Event()
+
+        def _watchdog_loop():
+            while not stop_watchdog.wait(1.0):
+                if pipeline_finished.is_set():
+                    break
+                elapsed = time.time() - self.last_activity_time
+                if elapsed > 15.0:
+                    is_hung.set()
+                    print(
+                        f"\n[Worker Watchdog] ⚠️ Phát hiện hệ thống không có tiến triển trong {elapsed:.1f}s! "
+                        f"Tiến hành reset lại Micro (KHÔNG kill tiến trình Brain để tránh ngắt dịch)..."
+                    )
+                    self.update_status_sig.emit("Hệ thống phản hồi chậm (Đang reset Micro)...")
+
+                    # Chỉ reset lại Microphone, TUYỆT ĐỐI KHÔNG kill tiến trình Brain/subprocess
+                    try:
+                        self.wake_engine.reset_microphone()
+                    except Exception as mic_err:
+                        print(f"[Worker Watchdog Cảnh báo reset micro]: {mic_err}")
+                    break
+
+        watchdog_thread = threading.Thread(
+            target=_watchdog_loop,
+            name="TeoWatchdogThread",
+            daemon=True,
+        )
+        watchdog_thread.start()
+
         try:
-            # 1. Mở Overlay và phát tiếng Bíp
+            # 1. Mở Overlay và phát tiếng Bíp (chỉ khi Lớp 3 hoặc Lớp 4 đã xác thực thành công từ khóa)
             self.show_overlay_sig.emit("Tèo đang lắng nghe...")
             try:
                 winsound.Beep(1200, 180)  # Tần số 1200Hz, 180ms
             except Exception:
                 pass
 
-            # 2. Thu âm câu lệnh qua STT Engine
+            # 2. Thu âm câu lệnh qua STT Engine (silence_limit=1.5s, max_duration=6.0s)
             print("\n[Tèo Assistant] 🎙️ Đang lắng nghe câu lệnh người dùng...")
-            audio_bytes = self.stt.record_wake_command(max_duration=4.0, silence_limit=0.85)
+            self.ping_activity("Bắt đầu thu âm giọng nói...")
+            audio_bytes = self.stt.record_wake_command(max_duration=6.0, silence_limit=1.5)
+            self.ping_activity("Thu âm giọng nói hoàn tất")
 
             if not audio_bytes:
                 self.update_status_sig.emit("Không nghe thấy lệnh...")
@@ -227,7 +291,9 @@ class CommandProcessingWorker(QThread):
             def _pipeline_task():
                 # 3. Nhận diện giọng nói
                 self.update_status_sig.emit("Đang nhận diện giọng nói...")
+                self.ping_activity("Bắt đầu nhận diện STT")
                 user_text = self.stt.process_audio(audio_bytes)
+                self.ping_activity("STT nhận diện hoàn tất")
 
                 if not user_text or not user_text.strip():
                     self.update_status_sig.emit("Không nghe rõ câu lệnh...")
@@ -240,53 +306,40 @@ class CommandProcessingWorker(QThread):
 
                 # 4. Phân tích ý định qua Bộ não
                 self.update_status_sig.emit("Đang thực thi lệnh...")
+                self.ping_activity(f"Bắt đầu phân tích ý định Brain: '{user_text}'")
                 t0 = time.time()
                 actions_list = self.brain.process(user_text)
                 elapsed = round(time.time() - t0, 3)
+                self.ping_activity(f"Brain phân tích xong ({elapsed}s)")
                 print(f"[Tèo Assistant 🧠] Ý định giải mã xong ({elapsed}s): {actions_list}")
 
                 # 5. Thực thi các hành động
                 if actions_list:
+                    self.ping_activity("Bắt đầu thực thi các hành động Action")
                     self.executor.execute(actions_list)
+                    self.ping_activity("Thực thi các hành động hoàn tất")
                     time.sleep(0.5)
 
                 print("[Tèo Assistant] ✓ Đã hoàn thành lệnh. Sẵn sàng lắng nghe từ khóa tiếp theo.")
 
-            # Cơ chế Timeout 5 giây chống treo App:
-            # Nếu xử lý quá 5 giây, kill tiến trình và reset lại Micro
+            # Thực thi pipeline và giám sát linh hoạt bằng Watchdog (Không dùng timeout 5s tuyệt đối)
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 future = pool.submit(_pipeline_task)
-                try:
-                    future.result(timeout=5.0)
-                except concurrent.futures.TimeoutError:
-                    print("\n[Worker] ⚠️ Xử lý câu lệnh quá 5 giây (Timeout 5s)! Đang kill tiến trình và reset lại Micro...")
-                    self.update_status_sig.emit("Quá thời gian xử lý (Timeout 5s)...")
-
-                    # Kill các tiến trình con phát sinh
-                    if psutil:
-                        try:
-                            parent_proc = psutil.Process()
-                            for child in parent_proc.children(recursive=True):
-                                try:
-                                    child.kill()
-                                except Exception:
-                                    pass
-                        except Exception as k_err:
-                            print(f"[Worker Cảnh báo kill]: {k_err}")
-
-                    # Reset lại Microphone
+                while not future.done():
                     try:
-                        self.wake_engine.reset_microphone()
-                    except Exception as mic_err:
-                        print(f"[Worker Cảnh báo reset micro]: {mic_err}")
-
-                    time.sleep(0.8)
+                        future.result(timeout=0.5)
+                    except concurrent.futures.TimeoutError:
+                        if is_hung.is_set():
+                            print("[Worker] ⚠️ Watchdog báo treo cứng > 15s. Hủy chờ pipeline.")
+                            break
 
         except Exception as exc:
             print(f"[Tèo Assistant Lỗi Pipeline]: {exc}")
             import traceback
             traceback.print_exc()
         finally:
+            pipeline_finished.set()
+            stop_watchdog.set()
             self.hide_overlay_sig.emit()
             self._is_busy = False
             # Mở lại luồng lắng nghe Wake Word sau khi hoàn tất
@@ -315,7 +368,7 @@ class TeoAssistantApp:
         self.app.setQuitOnLastWindowClosed(False)  # Giữ app chạy nền khi đóng overlay
 
         print("\n" + "=" * 68)
-        print("     KHỞI ĐỘNG TÈO ASSISTANT v1.1.0 (VOSK WAKE WORD & TRAY OVERLAY)")
+        print("     KHỞI ĐỘNG TÈO ASSISTANT v1.2.0 (VOSK WAKE WORD & TRAY OVERLAY)")
         print("=" * 68)
 
         # 2. Khởi tạo Giao diện Overlay
@@ -328,11 +381,17 @@ class TeoAssistantApp:
         self.brain = Brain()
         self.executor = ActionExecutor()
 
-        # 4. Khởi tạo Wake Word Engine bằng Vosk tiếng Việt
-        print("[Tèo] [3/4] Đang khởi tạo Wake Word Engine Vosk ('Hey Tèo')...")
+        # 4. Khởi tạo Wake Word Engine bằng Vosk kết hợp Voice Auth (Resemblyzer) & Google STT xác thực chéo
+        print("[Tèo] [3/4] Đang khởi tạo Wake Word Engine ('Tèo đâu') với Voice Auth sinh trắc học...")
         self.wake_engine = WakeWordEngine(
-            wake_keyword="hey tèo",
+            wake_keyword="tèo đâu",
             on_detected=self._on_wake_word_triggered,
+            min_conf=0.60,
+            fuzzy_threshold=70.0,
+            voice_auth_threshold=0.80,
+            min_rms=350.0,
+            cooldown_sec=1.0,
+            stt_verifier=self.stt.recognize_google,
         )
 
         # 5. Khởi tạo Worker xử lý giọng nói (QThread)
@@ -355,18 +414,18 @@ class TeoAssistantApp:
     def _setup_system_tray(self) -> None:
         """Thiết lập biểu tượng và menu ngữ cảnh cho Khay hệ thống Windows."""
         self.tray_icon = QSystemTrayIcon(create_tray_icon(), self.app)
-        self.tray_icon.setToolTip("Tèo Assistant v1.1.0 - Sẵn sàng (Nói 'Hey Tèo')")
+        self.tray_icon.setToolTip("Tèo Assistant v1.2.0 - Sẵn sàng (Nói 'Tèo đâu')")
 
         self.tray_menu = QMenu()
 
         # 1. Tiêu đề thông tin
-        title_action = QAction("Tèo Assistant v1.1.0 (Đang hoạt động)", self.tray_menu)
+        title_action = QAction("Tèo Assistant v1.2.0 (Đang hoạt động)", self.tray_menu)
         title_action.setEnabled(False)
         self.tray_menu.addAction(title_action)
         self.tray_menu.addSeparator()
 
         # 2. Bật/Tắt Lắng nghe Wake Word
-        self.toggle_wake_action = QAction("Lắng nghe Wake Word (Hey Tèo)", self.tray_menu)
+        self.toggle_wake_action = QAction("Lắng nghe Wake Word (Tèo đâu)", self.tray_menu)
         self.toggle_wake_action.setCheckable(True)
         self.toggle_wake_action.setChecked(True)
         self.toggle_wake_action.triggered.connect(self._toggle_wake_word)
@@ -386,11 +445,16 @@ class TeoAssistantApp:
         self.autostart_action.triggered.connect(self._toggle_autostart)
         self.tray_menu.addAction(self.autostart_action)
 
-        # 5. Cấu hình Microphone (Submenu chọn Micro)
-        self.mic_submenu = self.tray_menu.addMenu("🎙️ Cấu hình Micro")
+        # 5. Đăng ký / Cập nhật Giọng nói (Voice ID)
+        enroll_voice_action = QAction("🎙️ Đăng ký / Cập nhật Giọng nói (Voice ID)", self.tray_menu)
+        enroll_voice_action.triggered.connect(self._enroll_voice_id)
+        self.tray_menu.addAction(enroll_voice_action)
+
+        # 6. Cấu hình Microphone (Submenu chọn Micro)
+        self.mic_submenu = self.tray_menu.addMenu("🎧 Cấu hình Micro")
         self._build_mic_menu(self.mic_submenu)
 
-        # 6. Mở file log debug (Bắt bệnh từ xa)
+        # 7. Mở file log debug (Bắt bệnh từ xa)
         open_log_action = QAction("📄 Mở file Log (teo_debug.log)", self.tray_menu)
         open_log_action.triggered.connect(self._open_log_file)
         self.tray_menu.addAction(open_log_action)
@@ -408,7 +472,7 @@ class TeoAssistantApp:
         # Thông báo chào mừng
         self.tray_icon.showMessage(
             "Tèo Assistant v1.3.1",
-            "Đã khởi động ngầm trên khay hệ thống.\nHãy gọi 'Hey Tèo' để ra lệnh!",
+            "Đã khởi động ngầm trên khay hệ thống.\nHãy gọi 'Tèo đâu' để ra lệnh!",
             QSystemTrayIcon.MessageIcon.Information,
             3500,
         )
@@ -481,6 +545,77 @@ class TeoAssistantApp:
             2500,
         )
 
+    def _enroll_voice_id(self) -> None:
+        """Kích hoạt chương trình ghi âm 10 lần khẩu lệnh 'Tèo đâu' để đăng ký Voice ID."""
+        # Tạm dừng Wake Word để nhường micro cho việc ghi âm
+        self.wake_engine.pause()
+
+        # Hiển thị thông báo hướng dẫn
+        msg_box = QMessageBox()
+        msg_box.setWindowTitle("Đăng ký Giọng nói Chủ nhân (Voice ID)")
+        msg_box.setIcon(QMessageBox.Icon.Information)
+        msg_box.setText(
+            "<h3>🎙️ Đăng ký Hồ sơ Giọng nói (Voice ID)</h3>"
+            "<p>Tính năng này giúp <b>Tèo Assistant chỉ phản hồi duy nhất với giọng nói của bạn</b>, "
+            "triệt tiêu hoàn toàn kích hoạt ảo do tiếng ồn hoặc người khác nói.</p>"
+            "<p><b>Quy trình thu âm:</b></p>"
+            "<ol>"
+            "<li>Một cửa sổ dòng lệnh (Console) sẽ hiện lên.</li>"
+            "<li>Hệ thống sẽ đếm ngược <b>3, 2, 1</b> và phát tiếng bíp.</li>"
+            "<li>Bạn nói rõ ràng: <b>\"Tèo đâu\"</b> (lặp lại <b>10 lần</b>).</li>"
+            "</ol>"
+            "<p>Nhấn <b>OK</b> để bắt đầu ghi âm ngay bây giờ!</p>"
+        )
+        msg_box.setStandardButtons(QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
+        ret = msg_box.exec()
+
+        if ret != QMessageBox.StandardButton.Ok:
+            self.wake_engine.resume()
+            return
+
+        import subprocess
+        from utils import is_frozen
+
+        if is_frozen():
+            cmd = [sys.executable, "--record-voice"]
+        else:
+            script_path = Path(__file__).resolve().parent / "record_my_voice.py"
+            cmd = [sys.executable, str(script_path)]
+
+        print(f"[App] 🎙️ Bắt đầu tiến trình ghi âm giọng nói: {cmd}")
+
+        try:
+            if sys.platform.startswith("win"):
+                proc = subprocess.Popen(
+                    cmd,
+                    creationflags=subprocess.CREATE_NEW_CONSOLE,
+                )
+            else:
+                proc = subprocess.Popen(cmd)
+
+            # Luồng giám sát hoàn thành
+            def _wait_and_reload():
+                proc.wait()
+                try:
+                    from voice_auth import get_authenticator
+                    auth = get_authenticator()
+                    auth.load_profile()
+                except Exception as exc:
+                    print(f"[App Lỗi] Không thể reload Voice profile: {exc}")
+                self.wake_engine.resume()
+                self.tray_icon.showMessage(
+                    "Đăng ký Giọng nói thành công",
+                    "Đã lưu thành công hồ sơ Voice ID! Giờ đây chỉ có bạn mới có thể đánh thức Tèo.",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    3500,
+                )
+
+            threading.Thread(target=_wait_and_reload, daemon=True, name="VoiceEnrollWatcher").start()
+
+        except Exception as exc:
+            print(f"[App Lỗi] Không thể khởi chạy tiến trình đăng ký giọng nói: {exc}")
+            self.wake_engine.resume()
+
     def _open_log_file(self) -> None:
         """Mở tệp teo_debug.log để người dùng xem trực tiếp."""
         log_path = get_exe_dir() / "teo_debug.log"
@@ -524,8 +659,8 @@ class TeoAssistantApp:
         self.wake_engine.start()
 
         print("\n" + "=" * 68)
-        print("✓ TÈO ASSISTANT v1.1.0 ĐÃ HOẠT ĐỘNG HOÀN TOÀN TRÊN KHAY HỆ THỐNG!")
-        print("• Hãy nói vào micro: 'Hey Tèo'")
+        print("✓ TÈO ASSISTANT v1.2.0 ĐÃ HOẠT ĐỘNG HOÀN TOÀN TRÊN KHAY HỆ THỐNG!")
+        print("• Hãy nói vào micro: 'Tèo đâu'")
         print("• Nhấn chuột phải vào icon ở góc màn hình (System Tray) để cấu hình:")
         print("    + Bật/Tắt Khởi động cùng Windows")
         print("    + Chọn thiết bị Microphone đang dùng")

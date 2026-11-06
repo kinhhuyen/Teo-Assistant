@@ -205,10 +205,22 @@ class MemoryManager:
             if not self.cache:
                 return None
 
+            close_patterns = r"\b(?:tắt|đóng|thoát|dừng|kill|exit|quit)\b"
+            open_patterns = r"\b(?:mở|mỡ|bật|vỡ|chạy|khởi\s+động|start|launch)\b"
+            input_is_close = bool(re.search(close_patterns, cleaned))
+            input_is_open = bool(re.search(open_patterns, cleaned))
+
             best_key: Optional[str] = None
             best_score: float = 0.0
 
             for cached_key in self.cache.keys():
+                # Chặn xung đột động từ ngay trong vòng lặp so khớp mờ:
+                # Nếu câu lệnh là tắt, tuyệt đối không so khớp mờ với key là lệnh mở (và ngược lại)
+                if input_is_close and not input_is_open and re.search(open_patterns, cached_key):
+                    continue
+                if input_is_open and not input_is_close and re.search(close_patterns, cached_key):
+                    continue
+
                 score = self._calculate_similarity(cleaned, cached_key)
                 if score > best_score:
                     best_score = score
