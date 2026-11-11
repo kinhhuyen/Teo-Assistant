@@ -17,7 +17,11 @@ import os
 from pathlib import Path
 import shutil
 import sys
+import threading
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+# Khóa đồng bộ hóa Microphone dùng chung toàn hệ thống chống xung đột stream
+MIC_LOCK = threading.RLock()
 
 # Cờ và biến lưu trạng thái logging toàn cục
 _LOGGING_INITIALIZED: bool = False

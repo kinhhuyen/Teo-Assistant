@@ -64,6 +64,11 @@ venv.bak/
 *.sublime-workspace
 
 # ==========================================
+# Legacy & Archival
+# ==========================================
+legacy/
+
+# ==========================================
 # Operating System Files & Logs
 # ==========================================
 Thumbs.db
@@ -71,4 +76,5 @@ ehthumbs.db
 Desktop.ini
 $RECYCLE.BIN/
 .DS_Store
+teo_debug.log
 *.log

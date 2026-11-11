@@ -61,7 +61,13 @@ try:
 except ImportError:
     sr = None
 
-from utils import get_configured_microphone, get_exe_dir, get_vosk_model_path, resource_path
+from utils import (
+    MIC_LOCK,
+    get_configured_microphone,
+    get_exe_dir,
+    get_vosk_model_path,
+    resource_path,
+)
 
 # Đảm bảo in tiếng Việt chuẩn trên Windows console
 if sys.platform.startswith("win"):
@@ -83,6 +89,20 @@ def strip_accents(text: str) -> str:
     return "".join([c for c in nfkd if not unicodedata.combining(c)]).lower().strip()
 
 
+class BoolCallable:
+    """Đối tượng vừa có giá trị boolean vừa có thể gọi hàm () để tương thích ngược."""
+    def __init__(self, val: bool):
+        self.val = bool(val)
+    def __bool__(self):
+        return self.val
+    def __call__(self):
+        return self.val
+    def __repr__(self):
+        return str(self.val)
+    def __eq__(self, other):
+        return bool(self.val) == bool(other)
+
+
 class WakeWordEngine:
     """
     Bộ lắng nghe và phát hiện Wake Word 'Tèo đâu' theo Kiến trúc 4 Lớp (Tối ưu phản hồi):
@@ -96,11 +116,12 @@ class WakeWordEngine:
     FRAME_MS: int = 30  # WebRTC VAD hỗ trợ 10, 20 hoặc 30ms
     BLOCK_SIZE: int = 480  # 480 samples ở 16kHz = đúng 30ms
     RECORD_DURATION_SEC: float = 2.5  # Thu âm tối đa 2.5s nếu người dùng nói liên tục
-    SILENCE_LIMIT_SEC: float = 0.6    # Ngưỡng khoảng lặng (0.6s) để dừng thu âm động sớm
+    SILENCE_LIMIT_SEC: float = 0.8    # Ngưỡng khoảng lặng (0.8s) để dừng thu âm động sớm
     MIN_RECORD_SEC: float = 0.8       # Thời gian thu âm tối thiểu (0.8s) cho từ khóa 2 âm tiết
 
     TARGET_KEYWORD: str = "teo dau"
     DEFAULT_MIN_RMS: float = 350.0
+    DUAL_AUTH_MIN_RMS: float = 500.0  # Ngưỡng RMS cho xác thực kép khi nói âm lượng bình thường
     DEFAULT_FUZZY_THRESHOLD: float = 70.0
     DEFAULT_VOICE_AUTH_THRESHOLD: float = 0.80
     DEFAULT_MIN_COSINE: float = 0.80
@@ -112,6 +133,17 @@ class WakeWordEngine:
     BLACKLIST_PHRASES: List[str] = [
         "tèo đâu rồi", "teo dau roi",
         "mày đi đâu", "may di dau",
+        "đi đâu", "di dau",
+        "ở đâu", "o dau",
+        "sao đâu", "sao dau",
+        "có đâu", "co dau",
+        "biết đâu", "biet dau",
+        "thế đâu", "the dau",
+        "đâu rồi", "dau roi",
+        "đâu đấy", "dau day",
+        "đâu nè", "dau ne",
+        "đâu thế", "dau the",
+        "đâu vậy", "dau vay",
     ]
     BLACKLIST_WORDS: List[str] = [
         "mèo", "meo",
@@ -132,7 +164,7 @@ class WakeWordEngine:
         input_device: Optional[int] = None,
         min_rms: float = 350.0,
         vad_mode: int = 2,
-        min_conf: float = 0.60,
+        min_conf: float = 0.65,
         fuzzy_threshold: float = 70.0,
         voice_auth_threshold: float = 0.80,
         min_cosine: Optional[float] = None,
@@ -140,7 +172,7 @@ class WakeWordEngine:
         voice_verifier: Optional[Callable[[bytes], Union[bool, Tuple[bool, float]]]] = None,
         on_early_wake: Optional[Callable[[], None]] = None,
         on_early_cancel: Optional[Callable[[], None]] = None,
-        silence_limit_sec: float = 0.6,
+        silence_limit_sec: float = 0.8,
         **kwargs,
     ) -> None:
         """
@@ -173,6 +205,7 @@ class WakeWordEngine:
         self.silence_limit_sec = silence_limit_sec
         self.cooldown_sec = cooldown_sec
         self.min_rms = min_rms
+        self.dual_auth_min_rms = kwargs.get("dual_auth_min_rms", self.DUAL_AUTH_MIN_RMS)
         self.vad_mode = vad_mode
         self.min_conf = min_conf
         self.fuzzy_threshold = fuzzy_threshold
@@ -216,9 +249,17 @@ class WakeWordEngine:
             grammar_json = json.dumps(grammar_list, ensure_ascii=False)
             try:
                 self.recognizer = vosk.KaldiRecognizer(self.model, float(self.SAMPLE_RATE), grammar_json)
+                try:
+                    self.recognizer.SetWords(True)
+                except Exception:
+                    pass
                 print(f"[WakeWord] ✓ Nạp Vosk thành công (Bật Grammar Lớp 4: {grammar_list}).")
             except Exception as gr_err:
                 self.recognizer = vosk.KaldiRecognizer(self.model, float(self.SAMPLE_RATE))
+                try:
+                    self.recognizer.SetWords(True)
+                except Exception:
+                    pass
                 print(f"[WakeWord Cảnh báo] Không thể nạp Grammar Vosk ({gr_err}), dùng recognizer mặc định.")
         except Exception as exc:
             print(f"[WakeWord Cảnh báo] Không thể nạp mô hình Vosk: {exc}")
@@ -227,7 +268,13 @@ class WakeWordEngine:
 
         self._running = False
         self._paused = False
+        self._is_listening = False
+        self.stream: Optional[sd.RawInputStream] = None
+        self.last_audio_time: float = time.time()
         self._thread: Optional[threading.Thread] = None
+        self.pre_buffer: collections.deque = collections.deque(maxlen=10)
+        self._watchdog_thread: Optional[threading.Thread] = None
+        self._stop_watchdog: threading.Event = threading.Event()
         self._lock = threading.Lock()
         self._last_trigger_time = 0.0
 
@@ -236,6 +283,35 @@ class WakeWordEngine:
             f"VAD mode={self.vad_mode}, RMS > {self.min_rms:.0f}, "
             f"Voice Auth thresh={self.voice_auth_threshold}, Cooldown={self.cooldown_sec}s."
         )
+
+    @property
+    def listen_thread(self) -> Optional[threading.Thread]:
+        """Luồng đọc microphone của Wake Word."""
+        return self._thread
+
+    @listen_thread.setter
+    def listen_thread(self, val: Optional[threading.Thread]):
+        self._thread = val
+
+    @property
+    def is_listening(self):
+        """Trạng thái lắng nghe của engine."""
+        return BoolCallable(self._is_listening)
+
+    @is_listening.setter
+    def is_listening(self, val: bool):
+        self._is_listening = bool(val)
+
+    def is_stream_alive(self) -> bool:
+        """Kiểm tra stream microphone đang hoạt động bình thường."""
+        try:
+            return (
+                self.stream is not None
+                and getattr(self.stream, "active", False)
+                and not getattr(self.stream, "stopped", True)
+            )
+        except Exception:
+            return False
 
     def _log_debug(self, message: str) -> None:
         """Ghi log có timestamp ra console và file teo_debug.log."""
@@ -342,11 +418,11 @@ class WakeWordEngine:
             self._log_debug(f"[WakeWord Cảnh báo] Lỗi tiền xử lý âm thanh STT: {exc}")
             return audio_bytes
 
-    def _recognize_google(self, audio_bytes: bytes, timeout: float = 1.5) -> Tuple[str, bool, str]:
+    def _recognize_google(self, audio_bytes: bytes, timeout: float = 2.5) -> Tuple[str, bool, str]:
         """
-        Gửi đoạn âm thanh lên Google STT (language='vi-VN', timeout cứng 1.5s).
-        Ép timeout cứng bằng ThreadPoolExecutor: Nếu quá 1.5s không phản hồi,
-        lập tức hủy luồng đó, ghi log '[Google STT] Timeout 1.5s -> Hủy và quay lại Lớp 1',
+        Gửi đoạn âm thanh lên Google STT (language='vi-VN', timeout cứng 2.5s).
+        Ép timeout cứng bằng ThreadPoolExecutor: Nếu quá 2.5s không phản hồi,
+        lập tức hủy luồng đó, ghi log '[Google STT] Timeout 2.5s -> Hủy và quay lại Lớp 1',
         trả về is_network_error=True để chuyển ngay sang Lớp 4 (Vosk) hoặc bỏ qua,
         và TUYỆT ĐỐI KHÔNG RETRY nếu bị timeout.
 
@@ -460,7 +536,7 @@ class WakeWordEngine:
     def is_blacklisted(cls, text: str) -> bool:
         """
         Kiểm tra blacklist chặn các từ nhầm lẫn:
-        - Các cụm từ: 'tèo đâu rồi', 'mày đi đâu' (và không dấu).
+        - Các cụm từ: 'tèo đâu rồi', 'mày đi đâu', 'ở đâu', 'đi đâu', 'sao đâu'...
         - Các từ đơn gây nhầm: 'mèo', 'heo', 'bèo', 'kèo', 'nèo' (và không dấu).
         """
         if not text:
@@ -471,7 +547,8 @@ class WakeWordEngine:
         clean = re.sub(r"\s+", " ", clean)
 
         for phrase in cls.BLACKLIST_PHRASES:
-            if phrase in raw_lower or phrase in clean:
+            pattern = r"\b" + re.escape(phrase) + r"\b"
+            if re.search(pattern, raw_lower) or re.search(pattern, clean):
                 return True
 
         raw_words = re.findall(r"\w+", raw_lower)
@@ -484,55 +561,60 @@ class WakeWordEngine:
         return False
 
     @classmethod
+    def _normalize_syllable(cls, s: str) -> str:
+        s = s.lower().replace("đ", "d").replace("Đ", "D")
+        nfkd = unicodedata.normalize("NFKD", s)
+        s = "".join([c for c in nfkd if not unicodedata.combining(c)]).strip()
+        return re.sub(r"[^\w]", "", s)
+
+    @classmethod
     def _is_google_text_matched(cls, google_text: str, threshold: float = 80.0) -> bool:
         """
-        Kiểm tra xem chuỗi Google STT trả về có khớp với từ khóa đánh thức hay không.
-        1. BLACKLIST: Lập tức BÁC BỎ nếu chứa các từ nhầm lẫn:
-           'mèo', 'heo', 'bèo', 'kèo', 'nèo', 'tèo đâu rồi', 'mày đi đâu'.
-        2. Khớp chính xác cụm từ 'teo dau'.
-        3. Regex khớp ranh giới từ 'teo dau'.
-        4. RapidFuzz so sánh độ tương đồng với 'teo dau' (ngưỡng >= 80.0%).
+        Kiểm tra matching theo âm tiết (thay thế hoàn toàn substring thô):
+        - Tách text gốc thành các âm tiết theo khoảng trắng.
+        - Chuẩn hóa từng âm tiết: lower + bỏ dấu tiếng Việt bằng unicodedata.
+        - Dùng rapidfuzz.ratio để so sánh.
+        - ACCEPT nếu thỏa CẢ 3 điều kiện:
+          + Tổng số âm tiết <= 3 và >= 2.
+          + Âm tiết cuối có rapidfuzz.ratio với "dau" >= 80.
+          + Có ít nhất 1 âm tiết trong các âm tiết còn lại có rapidfuzz.ratio với "teo" >= 80.
+        - REJECT mọi trường hợp còn lại.
         """
-        if not google_text:
+        if not google_text or not google_text.strip():
             return False
 
-        # --- BƯỚC 1: KIỂM TRA BLACKLIST CHẶN TỪ NHẦM LẪN ---
-        if cls.is_blacklisted(google_text):
+        raw_syllables = google_text.strip().split()
+        syllables = [cls._normalize_syllable(s) for s in raw_syllables if cls._normalize_syllable(s)]
+        if not syllables:
             return False
 
-        clean = strip_accents(google_text).lower()
-        clean = re.sub(r"[^\w\s]", " ", clean).strip()
-        clean = re.sub(r"\s+", " ", clean)
-        if not clean:
-            return False
+        last_syl = syllables[-1]
+        last_ratio = float(fuzz.ratio(last_syl, "dau"))
 
-        # 1. Khớp chính xác cụm từ 'teo dau'
-        if "teo dau" in clean:
-            return True
+        other_syls = syllables[:-1]
+        if other_syls:
+            teo_ratios = [float(fuzz.ratio(s, "teo")) for s in other_syls]
+            best_teo_ratio = max(teo_ratios)
+        else:
+            best_teo_ratio = 0.0
 
-        # 2. Regex khớp ranh giới từ 'teo dau'
-        if re.search(r"\bteo\s*dau\b", clean):
-            return True
+        is_match = (
+            2 <= len(syllables) <= 3
+            and last_ratio >= 80.0
+            and best_teo_ratio >= 80.0
+        )
 
-        # 3. Fuzzy Matching (rapidfuzz) so sánh với 'teo dau' (ngưỡng >= 80.0%)
-        # Áp dụng cho các câu ngắn (<= 3 từ) để chấp nhận 'em đâu', 'tiền đâu', 'theo đâu', 'tèo đó'...
-        words = clean.split()
-        if len(words) <= 3:
-            ratio_score = fuzz.ratio(clean, cls.TARGET_KEYWORD)
-            partial_score = fuzz.partial_ratio(clean, cls.TARGET_KEYWORD)
-            fuzzy_score = float(max(ratio_score, partial_score))
-            if fuzzy_score >= threshold:
-                return True
+        status = "ACCEPT" if is_match else "REJECT"
+        log_line = f"[WakeWord][Match] {status} syllables={syllables}, last_ratio={last_ratio:.1f}, first_ratio={best_teo_ratio:.1f}"
+        print(log_line, flush=True)
+        try:
+            log_path = get_exe_dir() / "teo_debug.log"
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + log_line + "\n")
+        except Exception:
+            pass
 
-        return False
-        if len(words) <= 3:
-            ratio_score = fuzz.ratio(clean, cls.TARGET_KEYWORD)
-            partial_score = fuzz.partial_ratio(clean, cls.TARGET_KEYWORD)
-            fuzzy_score = float(max(ratio_score, partial_score))
-            if fuzzy_score >= threshold:
-                return True
-
-        return False
+        return is_match
 
     # Alias để tương thích ngược với các test suite
     _is_google_stt_matched = _is_google_text_matched
@@ -567,15 +649,20 @@ class WakeWordEngine:
 
         is_owner, sim_score = self._verify_voice_auth(candidate_audio)
         if not is_owner:
-            # Cơ chế Xác thực kép: Nếu Google STT xác nhận "teo dau" VÀ RMS > 500
-            google_text, is_net_err, _ = self._recognize_google(candidate_audio, timeout=1.5)
-            if not is_net_err and self._is_google_text_matched(google_text) and effective_rms > 500.0:
-                self._trigger_wake(f"Xác thực kép: Google STT ('{google_text}', RMS={effective_rms:.0f})")
+            if effective_rms <= 500.0:
+                return False
+            google_text, is_net_err, _ = self._recognize_google(candidate_audio, timeout=2.5)
+            if not is_net_err and self._is_google_text_matched(google_text):
+                self._log_debug(
+                    f"[WakeWord][DualAuth] Voice Auth reject (cosine={sim_score:.2f}) "
+                    f"nhưng Google STT xác nhận '{google_text}' + RMS={effective_rms:.0f} -> KÍCH HOẠT."
+                )
+                self._trigger_wake(f"DualAuth: Google STT ('{google_text}', RMS={effective_rms:.0f})")
                 return True
             return False
 
         # Không phát tín hiệu hiển thị sớm (Đã gỡ bỏ Optimistic UI)
-        google_text, is_net_err, _ = self._recognize_google(candidate_audio, timeout=1.5)
+        google_text, is_net_err, _ = self._recognize_google(candidate_audio, timeout=2.5)
         if not is_net_err and self._is_google_text_matched(google_text):
             self._trigger_wake(f"Google STT ('{google_text}')")
             return True
@@ -702,10 +789,23 @@ class WakeWordEngine:
 
             res = json.loads(res_str) if res_str else {}
             vosk_text = res.get("text", "").strip()
-            self._log_debug(f"[WakeWord 🛟 Lớp 4 - Vosk Offline ({elapsed}s)] Kết quả: '{vosk_text}'")
+            word_items = res.get("result", [])
+            vosk_conf = (
+                sum(float(w.get("conf", 1.0)) for w in word_items) / len(word_items)
+                if word_items
+                else 1.0
+            )
+            self._log_debug(f"[WakeWord 🛟 Lớp 4 - Vosk Offline ({elapsed}s)] Kết quả: '{vosk_text}' (conf={vosk_conf:.2f})")
 
             if not vosk_text:
                 self._log_debug("[WakeWord 🛟 Lớp 4 ✗ BỎ QUA] Vosk không nhận diện được từ nào -> Bỏ qua, quay lại Lớp 1.")
+                return False
+
+            if word_items and vosk_conf < self.min_conf:
+                self._log_debug(
+                    f"[WakeWord 🛟 Lớp 4 ✗ BỎ QUA] Vosk nhận diện: '{vosk_text}' nhưng độ tin cậy quá thấp "
+                    f"({vosk_conf:.2f} < {self.min_conf:.2f}) -> Bỏ qua tạp âm, quay lại Lớp 1."
+                )
                 return False
 
             clean_text = strip_accents(vosk_text).lower()
@@ -783,7 +883,7 @@ class WakeWordEngine:
             self.input_device_name = device_name or (
                 f"Device {device_index}" if device_index is not None else "Mặc định hệ thống"
             )
-            was_running = self._running and not self._paused
+            was_running = self._running and bool(self.is_listening)
 
         self._log_debug(
             f"[WakeWord] 🎙️ Đã chuyển Microphone sang: {self.input_device_name} (device={self.input_device})"
@@ -796,50 +896,256 @@ class WakeWordEngine:
     def start(self) -> None:
         """Bắt đầu luồng lắng nghe Wake Word."""
         with self._lock:
-            if self._running:
+            if self._running and self.is_stream_alive():
                 return
             self._running = True
             self._paused = False
-            self._thread = threading.Thread(
-                target=self._listen_loop,
-                name="WakeWord4LayerThread",
-                daemon=True,
-            )
-            self._thread.start()
+            self._stop_watchdog.clear()
+
+            if self._watchdog_thread is None or not self._watchdog_thread.is_alive():
+                self._watchdog_thread = threading.Thread(
+                    target=self._watchdog_loop,
+                    name="AudioWatchdog",
+                    daemon=True,
+                )
+                self._watchdog_thread.start()
+
             self._log_debug(f"[WakeWord] 🎙️ Bắt đầu lắng nghe từ khóa '{self.wake_keyword}' (Kiến trúc 4 Lớp)...")
+
+        self.resume()
 
     def stop(self) -> None:
         """Dừng hoàn toàn luồng lắng nghe Wake Word."""
+        self._stop_watchdog.set()
+        self.pause()
         with self._lock:
             self._running = False
-            self._paused = False
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=1.5)
         self._log_debug("[WakeWord] ⏹️ Đã dừng luồng lắng nghe Wake Word.")
 
     def pause(self) -> None:
         """Tạm dừng lắng nghe và giải phóng micro để STT thu âm lệnh."""
         with self._lock:
+            self.is_listening = False
             self._paused = True
-        self._log_debug("[WakeWord] ⏸️ Tạm dừng lắng nghe Wake Word (nhường micro cho STT).")
+            if self.stream is not None:
+                try:
+                    self.stream.abort()
+                except Exception:
+                    pass
+
+        if self._thread and self._thread.is_alive() and threading.current_thread() != self._thread:
+            self._thread.join(timeout=1.0)
+
+        with self._lock:
+            if self.stream is not None:
+                try:
+                    self.stream.close()
+                except Exception:
+                    pass
+                self.stream = None
+
+        stream_alive = self.is_stream_alive()
+        self._log_debug(f"[WakeWord][State] listening={bool(self.is_listening)}, stream_alive={stream_alive}")
 
     def resume(self) -> None:
-        """Kích hoạt lại việc lắng nghe Wake Word sau khi thực thi lệnh xong."""
+        """
+        Kích hoạt lại việc lắng nghe Wake Word sau khi thực thi lệnh xong.
+        Đảm bảo stream đã sẵn sàng:
+        - Nếu stream đã active và thread đang chạy thì chỉ cần đảm bảo listening=True.
+        - Nếu chưa, mở stream mới (retry 3 lần) và khởi động listen_thread.
+        """
+        if (
+            self.is_stream_alive()
+            and bool(self.is_listening)
+            and self.listen_thread is not None
+            and self.listen_thread.is_alive()
+        ):
+            with self._lock:
+                self._paused = False
+                self._last_trigger_time = time.time()
+                self.last_audio_time = time.time()
+            self._log_debug("[WakeWord][Stream] resume OK: active=True, stopped=False, listening=True")
+            return
+
+        # 1. Đảm bảo đóng dọn dẹp stream cũ nếu còn
         with self._lock:
-            self._last_trigger_time = time.time()  # Bật cooldown chống kích hoạt lại
+            if self.is_stream_alive():
+                try:
+                    if self.stream is not None:
+                        self.stream.abort()
+                        self.stream.close()
+                except Exception:
+                    pass
+                self.stream = None
+
+        # 2. Thử mở stream trước, retry tối đa 3 lần
+        success = False
+        for attempt in range(1, 4):
+            with MIC_LOCK:
+                try:
+                    if self.stream is not None:
+                        try:
+                            self.stream.abort()
+                            self.stream.close()
+                        except Exception:
+                            pass
+                        self.stream = None
+
+                    self.stream = sd.RawInputStream(
+                        samplerate=self.SAMPLE_RATE,
+                        blocksize=self.BLOCK_SIZE,
+                        dtype="int16",
+                        channels=1,
+                        device=self.input_device,
+                    )
+                    self.stream.start()
+                except Exception as exc:
+                    self.stream = None
+
+            if (
+                self.stream is not None
+                and getattr(self.stream, "active", False)
+                and not getattr(self.stream, "stopped", True)
+            ):
+                success = True
+                break
+
+            if attempt < 3:
+                time.sleep(0.1)
+
+        # 3. Chỉ khi stream active mới set listening=True
+        if success:
+            with self._lock:
+                self.is_listening = True
+                self.last_audio_time = time.time()
+                self._paused = False
+                self._last_trigger_time = time.time()
+
+                if self._running and (self.listen_thread is None or not self.listen_thread.is_alive()):
+                    self.listen_thread = threading.Thread(
+                        target=self._listen_loop,
+                        name="WakeWord4LayerThread",
+                        daemon=True,
+                    )
+                    self.listen_thread.start()
+
+            self._log_debug("[WakeWord][Stream] resume OK: active=True, stopped=False, listening=True")
+        else:
+            with self._lock:
+                self.is_listening = False
+            active = getattr(self.stream, "active", False) if self.stream else False
+            stopped = getattr(self.stream, "stopped", True) if self.stream else True
+            self._log_debug(f"[WakeWord][Stream] resume FAILED sau 3 lần, active={active}, stopped={stopped}")
+
+    def force_reset_stream(self) -> None:
+        """
+        Cưỡng chế reset stream sạch:
+        - Set is_listening = False.
+        - Nếu self.listen_thread và self.listen_thread.is_alive(): join(timeout=1.0).
+          Nếu sau 1s vẫn alive, log cảnh báo và bỏ tham chiếu (thread cũ sẽ tự chết khi thấy is_listening=False ở vòng lặp kế).
+        - Close stream cũ nếu còn.
+        - Set self.stream = None.
+        - Clear pre-buffer deque.
+        - Set last_audio_time = time.time().
+        - Mở stream mới.
+        - Set is_listening = True.
+        - Khởi động listen_thread mới.
+        - Log [WakeWord][Stream] force_reset OK: active=True, thread_alive=True.
+        """
+        # 1. Set is_listening = False
+        with self._lock:
+            self.is_listening = False
+            self._paused = True
+            if self.stream is not None:
+                try:
+                    self.stream.abort()
+                except Exception:
+                    pass
+
+        # 2. Nếu self.listen_thread và self.listen_thread.is_alive(): join(timeout=1.0)
+        old_thread = self.listen_thread
+        if old_thread and old_thread.is_alive() and threading.current_thread() != old_thread:
+            old_thread.join(timeout=1.0)
+            if old_thread.is_alive():
+                self._log_debug("[WakeWord][Stream] Cảnh báo: listen_thread cũ vẫn alive sau 1s, bỏ tham chiếu.")
+        self.listen_thread = None
+
+        # 3. Close stream cũ nếu còn & Set self.stream = None
+        with MIC_LOCK:
+            if self.stream is not None:
+                try:
+                    self.stream.close()
+                except Exception:
+                    pass
+                self.stream = None
+
+        # 4. Clear pre-buffer deque
+        if hasattr(self, "pre_buffer") and self.pre_buffer is not None:
+            self.pre_buffer.clear()
+
+        # 5. Set last_audio_time = time.time()
+        self.last_audio_time = time.time()
+
+        # 6. Mở stream mới
+        with MIC_LOCK:
+            try:
+                new_stream = sd.RawInputStream(
+                    samplerate=self.SAMPLE_RATE,
+                    blocksize=self.BLOCK_SIZE,
+                    dtype="int16",
+                    channels=1,
+                    device=self.input_device,
+                )
+                new_stream.start()
+                self.stream = new_stream
+            except Exception as exc:
+                self._log_debug(f"[WakeWord Lỗi force_reset_stream]: {exc}")
+                self.stream = None
+
+        # 7. Set is_listening = True
+        with self._lock:
+            self.is_listening = True
             self._paused = False
-        self._log_debug(f"[WakeWord] ▶️ Tiếp tục lắng nghe từ khóa '{self.wake_keyword}'...")
+            self._last_trigger_time = time.time()
+
+            # 8. Khởi động listen_thread mới
+            if self._running:
+                self.listen_thread = threading.Thread(
+                    target=self._listen_loop,
+                    name="WakeWord4LayerThread",
+                    daemon=True,
+                )
+                self.listen_thread.start()
+
+        # 9. Log [WakeWord][Stream] force_reset OK: active=True, thread_alive=True
+        time.sleep(0.05)
+        active = self.is_stream_alive()
+        thread_alive = self.listen_thread.is_alive() if self.listen_thread else False
+        self._log_debug(f"[WakeWord][Stream] force_reset OK: active={active}, thread_alive={thread_alive}")
+
+    def _reopen_stream(self) -> None:
+        """Khởi động lại stream microphone khi bị đơ/chết ngầm."""
+        self._log_debug("[WakeWord] 🔄 _reopen_stream đang khởi động lại stream...")
+        self.force_reset_stream()
+
+    def _watchdog_loop(self) -> None:
+        """Thread AudioWatchdog, chu kỳ 0.5s, chạy trong lúc is_listening=True."""
+        while not self._stop_watchdog.wait(0.5):
+            if not self._running:
+                break
+            if bool(self.is_listening):
+                now = time.time()
+                last_chunk_age = now - self.last_audio_time
+                if last_chunk_age > 3.0:
+                    self._log_debug(
+                        f"[Watchdog][PANIC] Stream treo: {last_chunk_age:.1f}s không có audio chunk, tiến hành reset."
+                    )
+                    self.force_reset_stream()
 
     def reset_microphone(self) -> None:
         """Reset lại toàn bộ luồng Micro."""
         self._log_debug("[WakeWord] 🔄 Đang reset lại luồng Microphone...")
-        self.pause()
-        time.sleep(0.15)
-        self.resume()
-
-    def is_listening(self) -> bool:
-        """Kiểm tra xem engine có đang trong trạng thái lắng nghe tích cực không."""
-        return self._running and not self._paused
+        self.force_reset_stream()
 
     # =========================================================================
     # VÒNG LẶP LẮNG NGHE CHÍNH (KIẾN TRÚC 4 LỚP)
@@ -852,256 +1158,255 @@ class WakeWordEngine:
         - Lớp 3: Google STT (Trọng tài chính Online, tiền xử lý khử nhiễu + normalize, retry 1.5s, rapidfuzz >= 80%).
         - Lớp 4: Vosk Offline (Phao cứu sinh khi mất mạng, Grammar ['tèo đâu', 'teo dau', '[unk]'] + Fuzzy >= 70%).
         """
-        while self._running:
-            if self._paused:
-                time.sleep(0.05)
-                continue
+        if not self._running or not bool(self.is_listening) or not self.is_stream_alive():
+            return
 
-            stream = None
-            try:
-                stream = sd.RawInputStream(
-                    samplerate=self.SAMPLE_RATE,
-                    blocksize=self.BLOCK_SIZE,
-                    dtype="int16",
-                    channels=1,
-                    device=self.input_device,
-                )
-                stream.start()
+        # Buffer trượt lưu 300ms âm thanh trước thời điểm phát hiện tiếng nói
+        # (10 blocks x 30ms = 300ms) để không bị nuốt mất phụ âm đầu "Tèo..."
+        self.pre_buffer.clear()
+        pre_buffer = self.pre_buffer
+        # Tăng thời gian thu âm lên 2.5s (83 blocks x 30ms = 2.49s ~ 2.5s)
+        target_chunk_blocks = int(self.RECORD_DURATION_SEC / (self.FRAME_MS / 1000.0))
 
-                # Buffer trượt lưu 300ms âm thanh trước thời điểm phát hiện tiếng nói
-                # (10 blocks x 30ms = 300ms) để không bị nuốt mất phụ âm đầu "Tèo..."
-                pre_buffer = collections.deque(maxlen=10)
-                # Tăng thời gian thu âm lên 2.5s (83 blocks x 30ms = 2.49s ~ 2.5s)
-                target_chunk_blocks = int(self.RECORD_DURATION_SEC / (self.FRAME_MS / 1000.0))
+        self._log_debug(
+            f"[WakeWord] 🎙️ Đang liên tục lắng nghe qua Micro ({self.input_device_name}) "
+            f"[VAD mode={self.vad_mode}, RMS > {self.min_rms:.0f}]..."
+        )
 
+        try:
+            while self._running and bool(self.is_listening) and self.is_stream_alive():
+                try:
+                    data, overflowed = self.stream.read(self.BLOCK_SIZE)
+                except Exception as read_err:
+                    if self._running and bool(self.is_listening):
+                        self._log_debug(f"[WakeWord Lỗi Stream Read]: {read_err}")
+                    break
+
+                if not data:
+                    continue
+
+                # Cập nhật mốc thời gian nhận audio mới nhất mỗi chunk
+                self.last_audio_time = time.time()
+
+                # 1. Kiểm tra Cooldown sau lần kích hoạt gần nhất
+                now = time.time()
+                if (now - self._last_trigger_time) < self.cooldown_sec:
+                    pre_buffer.append(bytes(data))
+                    continue
+
+                # 2. Tính năng lượng âm lượng RMS của block 30ms
+                samples = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+                rms = float(np.sqrt(np.mean(samples ** 2))) if len(samples) > 0 else 0.0
+
+                # 3. LỚP 1: Kiểm tra xem có tiếng người hay không (VAD + RMS > 350)
+                is_speech_vad = False
+                if self.vad is not None:
+                    try:
+                        is_speech_vad = self.vad.is_speech(bytes(data), self.SAMPLE_RATE)
+                    except Exception:
+                        is_speech_vad = False
+                else:
+                    is_speech_vad = True
+
+                is_human_speech = is_speech_vad and (rms >= self.min_rms)
+
+                if not is_human_speech:
+                    # Là khoảng lặng hoặc tiếng ồn nhỏ -> Lưu vào pre_buffer và tiếp tục nghe
+                    pre_buffer.append(bytes(data))
+                    continue
+
+                # === PHÁT HIỆN TIẾNG NGƯỜI NÓI (LỚP 1 TRIGGER) ===
                 self._log_debug(
-                    f"[WakeWord] 🎙️ Đang liên tục lắng nghe qua Micro ({self.input_device_name}) "
-                    f"[VAD mode={self.vad_mode}, RMS > {self.min_rms:.0f}]..."
+                    f"\n[WakeWord 🎙️ LỚP 1] Pre-roll 300ms + ghi động (RMS: {rms:.0f} >= {self.min_rms:.0f}, "
+                    f"dừng khi im lặng {self.silence_limit_sec:.2f}s, tối đa {self.RECORD_DURATION_SEC:.1f}s)..."
                 )
 
-                while self._running and not self._paused:
-                    data, overflowed = stream.read(self.BLOCK_SIZE)
-                    if not data:
+                # Thu âm động: gồm 300ms trước đó + block hiện tại + các block tiếp theo
+                recorded_frames = list(pre_buffer)
+                recorded_frames.append(bytes(data))
+                consecutive_silence_blocks = 0
+                silence_target_blocks = int(self.silence_limit_sec / (self.FRAME_MS / 1000.0))  # 0.6s im lặng = 20 blocks
+                min_record_blocks = int(self.MIN_RECORD_SEC / (self.FRAME_MS / 1000.0))       # Thu tối thiểu 0.8s = ~26 blocks
+
+                while self._running and bool(self.is_listening) and self.is_stream_alive() and len(recorded_frames) < target_chunk_blocks:
+                    try:
+                        chunk, ov = self.stream.read(self.BLOCK_SIZE)
+                    except Exception:
+                        break
+                    if not chunk:
                         continue
+                    self.last_audio_time = time.time()
+                    chunk_bytes = bytes(chunk)
+                    recorded_frames.append(chunk_bytes)
 
-                    # 1. Kiểm tra Cooldown sau lần kích hoạt gần nhất
-                    now = time.time()
-                    if (now - self._last_trigger_time) < self.cooldown_sec:
-                        pre_buffer.append(bytes(data))
-                        continue
+                    # Kiểm tra xem block 30ms này có tiếng người không
+                    c_samples = np.frombuffer(chunk_bytes, dtype=np.int16).astype(np.float32)
+                    c_rms = float(np.sqrt(np.mean(c_samples ** 2))) if len(c_samples) > 0 else 0.0
 
-                    # 2. Tính năng lượng âm lượng RMS của block 30ms
-                    samples = np.frombuffer(data, dtype=np.int16).astype(np.float32)
-                    rms = float(np.sqrt(np.mean(samples ** 2))) if len(samples) > 0 else 0.0
-
-                    # 3. LỚP 1: Kiểm tra xem có tiếng người hay không (VAD + RMS > 350)
-                    is_speech_vad = False
+                    is_chunk_speech = False
                     if self.vad is not None:
                         try:
-                            is_speech_vad = self.vad.is_speech(bytes(data), self.SAMPLE_RATE)
+                            is_chunk_speech = self.vad.is_speech(chunk_bytes, self.SAMPLE_RATE)
                         except Exception:
-                            is_speech_vad = False
+                            is_chunk_speech = False
+                        # Kết hợp cả điều kiện VAD và RMS (ngưỡng duy trì 65% min_rms để không bị nuốt âm đuôi khi nói nhỏ/nhanh)
+                        is_chunk_speech = is_chunk_speech and (c_rms >= (self.min_rms * 0.65))
                     else:
-                        is_speech_vad = True
+                        is_chunk_speech = (c_rms >= (self.min_rms * 0.65))
 
-                    is_human_speech = is_speech_vad and (rms >= self.min_rms)
-
-                    if not is_human_speech:
-                        # Là khoảng lặng hoặc tiếng ồn nhỏ -> Lưu vào pre_buffer và tiếp tục nghe
-                        pre_buffer.append(bytes(data))
-                        continue
-
-                    # === PHÁT HIỆN TIẾNG NGƯỜI NÓI (LỚP 1 TRIGGER) ===
-                    self._log_debug(
-                        f"\n[WakeWord 🎙️ LỚP 1 - VAD] Phát hiện tiếng người (RMS: {rms:.0f} >= {self.min_rms:.0f}) "
-                        f"-> Bắt đầu thu âm động (dừng khi im lặng {self.silence_limit_sec:.1f}s, tối đa {self.RECORD_DURATION_SEC:.1f}s)..."
-                    )
-
-                    # Thu âm động: gồm 300ms trước đó + block hiện tại + các block tiếp theo
-                    recorded_frames = list(pre_buffer)
-                    recorded_frames.append(bytes(data))
-                    consecutive_silence_blocks = 0
-                    silence_target_blocks = int(self.silence_limit_sec / (self.FRAME_MS / 1000.0))  # 0.6s im lặng = 20 blocks
-                    min_record_blocks = int(self.MIN_RECORD_SEC / (self.FRAME_MS / 1000.0))       # Thu tối thiểu 0.8s = ~26 blocks
-
-                    while self._running and not self._paused and len(recorded_frames) < target_chunk_blocks:
-                        chunk, ov = stream.read(self.BLOCK_SIZE)
-                        if not chunk:
-                            continue
-                        chunk_bytes = bytes(chunk)
-                        recorded_frames.append(chunk_bytes)
-
-                        # Kiểm tra xem block 30ms này có tiếng người không
-                        c_samples = np.frombuffer(chunk_bytes, dtype=np.int16).astype(np.float32)
-                        c_rms = float(np.sqrt(np.mean(c_samples ** 2))) if len(c_samples) > 0 else 0.0
-
-                        is_chunk_speech = False
-                        if self.vad is not None:
-                            try:
-                                is_chunk_speech = self.vad.is_speech(chunk_bytes, self.SAMPLE_RATE)
-                            except Exception:
-                                is_chunk_speech = False
-                            # Kết hợp cả điều kiện VAD và RMS để không bị nhiễu nền đánh lừa
-                            is_chunk_speech = is_chunk_speech and (c_rms >= self.min_rms)
-                        else:
-                            is_chunk_speech = (c_rms >= self.min_rms)
-
-                        if not is_chunk_speech:
-                            consecutive_silence_blocks += 1
-                            # Nếu im lặng kéo dài 0.6s VÀ đã thu tối thiểu 0.8s -> Dừng thu âm sớm!
-                            if len(recorded_frames) >= min_record_blocks and consecutive_silence_blocks >= silence_target_blocks:
-                                dur_so_far = len(recorded_frames) * (self.FRAME_MS / 1000.0)
-                                self._log_debug(
-                                    f"[WakeWord 🎙️ LỚP 1 - Thu âm động] Phát hiện im lặng "
-                                    f"{consecutive_silence_blocks * self.FRAME_MS / 1000.0:.2f}s sau tiếng nói "
-                                    f"-> Dừng thu âm sớm ở {dur_so_far:.2f}s (thay vì chờ đủ {self.RECORD_DURATION_SEC:.1f}s)!"
-                                )
-                                break
-                        else:
-                            consecutive_silence_blocks = 0
-
-                    if not self._running or self._paused:
-                        break
-
-                    audio_chunk = b"".join(recorded_frames)
-                    pre_buffer.clear()
-
-                    # Kiểm tra độ dài âm thanh tối thiểu (tối thiểu 0.8s)
-                    if len(audio_chunk) < int(self.SAMPLE_RATE * 2 * self.MIN_RECORD_SEC):
-                        continue
-
-                    duration = len(audio_chunk) / (self.SAMPLE_RATE * 2)
-
-                    # Tính năng lượng RMS của toàn bộ đoạn audio 2.5s và phần tiếng nói thực tế
-                    chunk_samples = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32)
-                    chunk_rms = float(np.sqrt(np.mean(chunk_samples ** 2))) if len(chunk_samples) > 0 else 0.0
-
-                    active_samples = []
-                    for i in range(0, len(chunk_samples), self.BLOCK_SIZE):
-                        blk = chunk_samples[i : i + self.BLOCK_SIZE]
-                        if len(blk) > 0:
-                            b_rms = float(np.sqrt(np.mean(blk ** 2)))
-                            if b_rms >= self.min_rms:
-                                active_samples.extend(blk)
-                    active_rms = float(np.sqrt(np.mean(np.array(active_samples) ** 2))) if len(active_samples) > 0 else chunk_rms
-                    effective_rms = max(chunk_rms, active_rms)
-
-                    # === LỚP 2: VOICE AUTH (XÁC THỰC GIỌNG NÓI) ===
-                    self._log_debug(
-                        f"[WakeWord 🛡️ LỚP 2] Đang xác thực sinh trắc học giọng nói "
-                        f"({duration:.2f}s, RMS={chunk_rms:.0f}, effective_RMS={effective_rms:.0f})..."
-                    )
-                    is_owner, sim_score = self._verify_voice_auth(audio_chunk)
-
-                    if not is_owner:
-                        # --- CƠ CHẾ XÁC THỰC KÉP ---
-                        # Nếu Voice Auth TỪ CHỐI (cosine < 0.80 do môi trường ồn/nói nhỏ),
-                        # ĐỪNG vội hủy bỏ. Hãy chuyển âm thanh đó lên Lớp 3 (Google STT).
-                        # Nếu Google STT trả về chính xác 'Tèo đâu' VÀ RMS > 500 -> VẪN KÍCH HOẠT.
-                        self._log_debug(
-                            f"[VoiceAuth] Từ chối (cosine < {self.voice_auth_threshold:.2f}) "
-                            f"[cosine={sim_score:.2f}] -> Kích hoạt Cơ chế Xác thực kép (Chuyển lên Google STT)..."
-                        )
-                        google_text, is_net_err, err_msg = self._recognize_google(audio_chunk, timeout=1.5)
-                        if is_net_err:
+                    if not is_chunk_speech:
+                        consecutive_silence_blocks += 1
+                        # Nếu im lặng kéo dài 0.6s VÀ đã thu tối thiểu 0.8s -> Dừng thu âm sớm!
+                        if len(recorded_frames) >= min_record_blocks and consecutive_silence_blocks >= silence_target_blocks:
+                            dur_so_far = len(recorded_frames) * (self.FRAME_MS / 1000.0)
                             self._log_debug(
-                                f"[VoiceAuth 🛡️ Xác thực kép] Google STT lỗi/timeout ({err_msg}) "
-                                f"-> Hủy và quay lại Lớp 1."
+                                f"[WakeWord 🎙️ LỚP 1 - Thu âm động] Phát hiện im lặng "
+                                f"{consecutive_silence_blocks * self.FRAME_MS / 1000.0:.2f}s sau tiếng nói "
+                                f"-> Dừng thu âm sớm ở {dur_so_far:.2f}s (thay vì chờ đủ {self.RECORD_DURATION_SEC:.1f}s)!"
                             )
-                            time.sleep(0.1)
-                            continue
-                        elif self._is_google_text_matched(google_text):
-                            if effective_rms > 500.0:
-                                self._log_debug(
-                                    f"\n=======================================================\n"
-                                    f"[WakeWord 🎯 XÁC THỰC KÉP THÀNH CÔNG] Dù Voice Auth ({sim_score:.2f} < {self.voice_auth_threshold:.2f}) "
-                                    f"nhưng Google STT xác nhận chính xác: \"{google_text}\" VÀ RMS={effective_rms:.0f} > 500 "
-                                    f"-> VẪN KÍCH HOẠT WAKE WORD (Glow Orb & Bíp)!\n"
-                                    f"======================================================="
-                                )
-                                self._trigger_wake(f"Xác thực kép: Google STT ('{google_text}', RMS={effective_rms:.0f})")
-                                break
-                            else:
-                                self._log_debug(
-                                    f"[WakeWord 🛡️ Xác thực kép ✗ TỪ CHỐI] Google STT nghe ra '{google_text}' nhưng RMS={effective_rms:.0f} <= 500 "
-                                    f"(không đủ điều kiện âm lượng xác thực kép) -> HỦY BỎ, quay lại Lớp 1."
-                                )
-                                time.sleep(0.1)
-                                continue
-                        else:
-                            self._log_debug(
-                                f"[VoiceAuth] Từ chối (cosine {sim_score:.2f} < {self.voice_auth_threshold:.2f}) "
-                                f"và Google STT không xác nhận (kết quả: '{google_text}') -> HỦY BỎ, quay lại Lớp 1!"
-                            )
-                            time.sleep(0.1)
-                            continue
-
-                    if sim_score == 1.0:
-                        self._log_debug(
-                            "[WakeWord 🛡️ LỚP 2 ℹ️ BỎ QUA] Chưa có file 'my_voice.pkl' (người dùng mới) "
-                            "-> Bỏ qua xác thực giọng nói, chuyển sang Lớp 3."
-                        )
-                    else:
-                        self._log_debug(
-                            f"[WakeWord 🛡️ LỚP 2 ✓ CHẤP NHẬN] Đúng giọng chủ nhân "
-                            f"(cosine={sim_score:.2f} >= {self.voice_auth_threshold:.2f}) "
-                            f"-> Chuyển sang Lớp 3 (Google STT) để xác nhận từ khóa."
-                        )
-
-                    # === LỚP 3: GOOGLE STT (TRỌNG TÀI CHÍNH - ONLINE) ===
-                    self._log_debug(
-                        f"[WakeWord 🌐 LỚP 3] Gửi audio {duration:.2f}s lên Google STT "
-                        f"(language='vi-VN', timeout cứng 1.5s)..."
-                    )
-                    google_text, is_net_err, err_msg = self._recognize_google(audio_chunk, timeout=1.5)
-
-                    if is_net_err:
-                        # Google STT bị lỗi mạng/timeout cứng 1.5s -> Chuyển sang LỚP 4: VOSK OFFLINE!
-                        self._log_debug(
-                            f"[WakeWord 🌐 LỚP 3 ⚠️ TIMEOUT/LỖI MẠNG] Google STT không phản hồi ({err_msg}) "
-                            f"-> Chuyển ngay sang LỚP 4: VOSK (Phao cứu sinh Offline)!"
-                        )
-                        vosk_matched = self._handle_layer4_vosk(audio_chunk)
-                        if vosk_matched:
                             break
-                        else:
-                            # Vosk Offline cũng không khớp -> Bỏ qua, quay lại Lớp 1
-                            time.sleep(0.1)
-                            continue
-
-                    # Google STT kết nối trực tuyến thành công
-                    self._log_debug(f"[WakeWord 🌐 LỚP 3] Google STT trả về: \"{google_text}\"")
-
-                    if self._is_google_text_matched(google_text):
-                        self._log_debug(
-                            f"[WakeWord 🌐 LỚP 3 ✓ TRỌNG TÀI CHÍNH XÁC NHẬN] "
-                            f"Google STT xác nhận chứa 'teo dau': \"{google_text}\" "
-                            f"-> KÍCH HOẠT WAKE WORD (Glow Orb & Bíp)!"
-                        )
-                        self._trigger_wake(f"Google STT ('{google_text}')")
-                        break
                     else:
+                        consecutive_silence_blocks = 0
+
+                if not self._running or not bool(self.is_listening):
+                    break
+
+                audio_chunk = b"".join(recorded_frames)
+                pre_buffer.clear()
+
+                # Kiểm tra độ dài âm thanh tối thiểu (tối thiểu 0.8s)
+                if len(audio_chunk) < int(self.SAMPLE_RATE * 2 * self.MIN_RECORD_SEC):
+                    continue
+
+                duration = len(audio_chunk) / (self.SAMPLE_RATE * 2)
+
+                # Tính năng lượng RMS của toàn bộ đoạn audio 2.5s và phần tiếng nói thực tế
+                chunk_samples = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32)
+                chunk_rms = float(np.sqrt(np.mean(chunk_samples ** 2))) if len(chunk_samples) > 0 else 0.0
+
+                active_samples = []
+                for i in range(0, len(chunk_samples), self.BLOCK_SIZE):
+                    blk = chunk_samples[i : i + self.BLOCK_SIZE]
+                    if len(blk) > 0:
+                        b_rms = float(np.sqrt(np.mean(blk ** 2)))
+                        if b_rms >= self.min_rms:
+                            active_samples.extend(blk)
+                active_rms = float(np.sqrt(np.mean(np.array(active_samples) ** 2))) if len(active_samples) > 0 else chunk_rms
+                effective_rms = max(chunk_rms, active_rms)
+
+                # === LỚP 2: VOICE AUTH (XÁC THỰC GIỌNG NÓI) ===
+                self._log_debug(
+                    f"[WakeWord 🛡️ LỚP 2] Đang xác thực sinh trắc học giọng nói "
+                    f"({duration:.2f}s, RMS={chunk_rms:.0f}, effective_RMS={effective_rms:.0f})..."
+                )
+                is_owner, sim_score = self._verify_voice_auth(audio_chunk)
+
+                if not is_owner:
+                    # 1. Xác thực kép có điều kiện RMS:
+                    # - Nếu RMS <= 500 và Voice Auth reject: reject luôn, không gọi Google, để tiết kiệm request.
+                    if effective_rms <= 500.0:
                         self._log_debug(
-                            f"[WakeWord 🌐 LỚP 3 ✗ BÁC BỎ] Google STT trả về \"{google_text}\" "
-                            f"(không chứa 'teo dau') -> BỎ QUA, quay lại Lớp 1."
+                            f"[VoiceAuth] Từ chối (cosine={sim_score:.2f} < {self.voice_auth_threshold:.2f}, "
+                            f"RMS={effective_rms:.0f} <= 500) -> Reject, không gọi Google."
                         )
                         time.sleep(0.1)
                         continue
 
-            except Exception as exc:
-                if self._running and not self._paused:
-                    self._log_debug(f"[WakeWord Lỗi Stream Audio]: {exc}")
-                    if self.input_device is not None:
-                        self._log_debug("[WakeWord] Tự động thử lại với Micro mặc định...")
-                        self.input_device = None
-                    time.sleep(0.3)
-            finally:
-                if stream is not None:
+                    # - Khi Voice Auth reject (cosine < 0.80) NHƯNG RMS > 500:
+                    #   + Vẫn gửi audio lên Google STT như bình thường.
+                    self._log_debug(
+                        f"[VoiceAuth] Từ chối (cosine={sim_score:.2f} < {self.voice_auth_threshold:.2f}) "
+                        f"NHƯNG RMS={effective_rms:.0f} > 500 -> Gửi Google STT để xác thực kép..."
+                    )
+                    google_text, is_net_err, err_msg = self._recognize_google(audio_chunk, timeout=2.5)
+                    if is_net_err:
+                        self._log_debug(
+                            f"[VoiceAuth 🛡️ Xác thực kép] Google STT lỗi/timeout ({err_msg}) -> Hủy và quay lại Lớp 1."
+                        )
+                        time.sleep(0.1)
+                        continue
+                    elif self._is_google_text_matched(google_text):
+                        self._log_debug(
+                            f"[WakeWord][DualAuth] Voice Auth reject (cosine={sim_score:.2f}) "
+                            f"nhưng Google STT xác nhận '{google_text}' + RMS={effective_rms:.0f} -> KÍCH HOẠT."
+                        )
+                        self._trigger_wake(f"DualAuth: Google STT ('{google_text}', RMS={effective_rms:.0f})")
+                        break
+                    else:
+                        self._log_debug(
+                            f"[VoiceAuth] Từ chối (cosine {sim_score:.2f} < {self.voice_auth_threshold:.2f}) "
+                            f"và Google STT không xác nhận (kết quả: '{google_text}') -> HỦY BỎ, quay lại Lớp 1!"
+                        )
+                        time.sleep(0.1)
+                        continue
+
+                if sim_score == 1.0:
+                    self._log_debug(
+                        "[WakeWord 🛡️ LỚP 2 ℹ️ BỎ QUA] Chưa có file 'my_voice.pkl' (người dùng mới) "
+                        "-> Bỏ qua xác thực giọng nói, chuyển sang Lớp 3."
+                    )
+                else:
+                    self._log_debug(
+                        f"[WakeWord 🛡️ LỚP 2 ✓ CHẤP NHẬN] Đúng giọng chủ nhân "
+                        f"(cosine={sim_score:.2f} >= {self.voice_auth_threshold:.2f}) "
+                        f"-> Chuyển sang Lớp 3 (Google STT) để xác nhận từ khóa."
+                    )
+
+                # === LỚP 3: GOOGLE STT (TRỌNG TÀI CHÍNH - ONLINE) ===
+                self._log_debug(
+                    f"[WakeWord 🌐 LỚP 3] Gửi audio {duration:.2f}s lên Google STT "
+                    f"(language='vi-VN', timeout cứng 2.5s)..."
+                )
+                google_text, is_net_err, err_msg = self._recognize_google(audio_chunk, timeout=2.5)
+
+                if is_net_err:
+                    # Google STT bị lỗi mạng/timeout cứng 1.5s -> Chuyển sang LỚP 4: VOSK OFFLINE!
+                    self._log_debug(
+                        f"[WakeWord 🌐 LỚP 3 ⚠️ TIMEOUT/LỖI MẠNG] Google STT không phản hồi ({err_msg}) "
+                        f"-> Chuyển ngay sang LỚP 4: VOSK (Phao cứu sinh Offline)!"
+                    )
+                    vosk_matched = self._handle_layer4_vosk(audio_chunk)
+                    if vosk_matched:
+                        break
+                    else:
+                        time.sleep(0.1)
+                        continue
+
+                # Google STT kết nối trực tuyến thành công
+                self._log_debug(f"[WakeWord 🌐 LỚP 3] Google STT trả về: \"{google_text}\"")
+
+                if self._is_google_text_matched(google_text):
+                    self._log_debug(
+                        f"[WakeWord 🌐 LỚP 3 ✓ TRỌNG TÀI CHÍNH XÁC NHẬN] "
+                        f"Google STT xác nhận chứa 'teo dau': \"{google_text}\" "
+                        f"-> KÍCH HOẠT WAKE WORD (Glow Orb & Bíp)!"
+                    )
+                    self._trigger_wake(f"Google STT ('{google_text}')")
+                    break
+                else:
+                    self._log_debug(
+                        f"[WakeWord 🌐 LỚP 3 ✗ BÁC BỎ] Google STT trả về \"{google_text}\" "
+                        f"(không chứa 'teo dau') -> BỎ QUA, quay lại Lớp 1."
+                    )
+                    time.sleep(0.1)
+                    continue
+
+        except Exception as exc:
+            if self._running and bool(self.is_listening):
+                self._log_debug(f"[WakeWord Lỗi Stream Audio]: {exc}")
+                if self.input_device is not None:
+                    self._log_debug("[WakeWord] Tự động thử lại với Micro mặc định...")
+                    self.input_device = None
+                time.sleep(0.3)
+        finally:
+            with MIC_LOCK:
+                if self.stream is not None:
                     try:
-                        stream.stop()
-                        stream.close()
+                        self.stream.stop()
+                        self.stream.close()
                     except Exception:
                         pass
+                    self.stream = None
 
 
 # =============================================================================

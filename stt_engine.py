@@ -14,15 +14,18 @@ import concurrent.futures
 import json
 import os
 import queue
+import re
 import socket
 import sys
 import threading
 import time
+import unicodedata
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import sounddevice as sd
+from utils import MIC_LOCK
 
 # 1. Thư viện SpeechRecognition (Google STT)
 HAS_SPEECH_RECOGNITION = False
@@ -81,6 +84,9 @@ class SpeechToText:
         """
         self.language = language
         self.samples_per_frame = self.CHUNK_SIZE  # Khởi tạo chunk size 1024 cho PortAudio/sounddevice mượt hơn
+        self._cancel_recording = threading.Event()  # Cờ hủy ghi âm tức thì để giải phóng microphone
+        self._wake_interrupted = False  # Cờ báo hiệu bắt được từ khóa Wake Word trong lúc đang thu âm lệnh
+        self.wake_engine = kwargs.get("wake_engine", None)  # Tham chiếu WakeWordEngine để phối hợp luồng mic
 
         # Khởi tạo Recognizer của SpeechRecognition cho Google STT
         if HAS_SPEECH_RECOGNITION:
@@ -128,6 +134,10 @@ class SpeechToText:
         self.input_device_name = device_name or (f"Device {device_index}" if device_index is not None else "Mặc định hệ thống")
         print(f"[STT] 🎙️ Đã chuyển Microphone sang: {self.input_device_name} (device={self.input_device})")
 
+    def set_wake_engine(self, wake_engine) -> None:
+        """Gán tham chiếu WakeWordEngine để phối hợp giải phóng và kích hoạt lại micro."""
+        self.wake_engine = wake_engine
+
     def check_microphone(self) -> dict:
         """Kiểm tra Microphone khả dụng trên Windows."""
         try:
@@ -155,9 +165,30 @@ class SpeechToText:
     def release_microphone(self) -> None:
         """Giải phóng luồng Micro để tránh nghẽn/kẹt."""
         try:
+            self._cancel_recording.set()
             sd.stop()
         except Exception:
             pass
+
+    def cancel_recording(self) -> None:
+        """Hủy ngay lập tức phiên ghi âm hiện tại và giải phóng microphone."""
+        self._cancel_recording.set()
+
+    @staticmethod
+    def is_wake_word_intercept(text: str) -> bool:
+        """
+        Kiểm tra xem câu lệnh nhận diện có chứa từ khóa đánh thức 'tèo đâu' / 'teo dau' hay không.
+        Bắt triệt để các trường hợp: 'mở tèo đâu', 'tèo đâu', 'tèo đâu mở excel', 'alo tèo đâu'...
+        """
+        if not text:
+            return False
+        clean = text.lower().replace("đ", "d").replace("Đ", "D")
+        import unicodedata
+        nfkd = unicodedata.normalize("NFKD", clean)
+        clean = "".join([c for c in nfkd if not unicodedata.combining(c)]).lower().strip()
+        clean = re.sub(r"[^\w\s]", " ", clean).strip()
+        clean = re.sub(r"\s+", " ", clean)
+        return "teo dau" in clean or bool(re.search(r"\bteo\s*dau\b", clean))
 
     @staticmethod
     def is_online(host: str = "8.8.8.8", port: int = 53, timeout: float = 0.3) -> bool:
@@ -378,52 +409,112 @@ class SpeechToText:
         - Tự động ngắt khi phát hiện khoảng lặng (silence_limit = 1.5s) sau khi đã nói xong.
         - Cho phép người dùng ngập ngừng lấy hơi 1.0s mà không bị cắt ngang câu lệnh.
         - Tối đa max_duration (6.0s) để tránh treo nếu môi trường có tiếng ồn nền.
+        - Tích hợp giám sát thời gian thực bằng Vosk: nếu phát hiện người dùng nói 'Tèo đâu' ngắt ngang
+          trong lúc đang thu âm, lập tức dừng ngay mà không cần chờ hết câu.
         """
+        self._cancel_recording.clear()
+        self._wake_interrupted = False
         self.check_microphone()
         chunk_size = self.CHUNK_SIZE
         recorded_frames = []
         speech_started = False
         silence_start = None
         start_time = time.time()
-        speech_energy_threshold = 350.0  # RMS threshold cho giọng nói người (nói bình thường là nhận)
+        speech_energy_threshold = 280.0  # RMS threshold cho giọng nói người (nói bình thường/nhỏ là nhận)
+
+        # Bộ giám sát Vosk nhẹ để bắt từ khóa 'tèo đâu' trực tiếp trong lúc đang thu âm
+        vosk_interceptor = None
+        if self.vosk_model is not None:
+            try:
+                vosk_interceptor = vosk.KaldiRecognizer(self.vosk_model, float(self.SAMPLE_RATE))
+                vosk_interceptor.SetWords(False)
+            except Exception:
+                vosk_interceptor = None
+
+        # Không mở InputStream mới nếu wake engine chưa close stream (chờ tối đa 0.5s)
+        if self.wake_engine is not None and hasattr(self.wake_engine, "is_stream_alive"):
+            t_wait = time.time()
+            while self.wake_engine.is_stream_alive() and (time.time() - t_wait) < 0.5:
+                time.sleep(0.02)
 
         print("[STT] Đang nghe...")
-        try:
-            with sd.InputStream(samplerate=self.SAMPLE_RATE, channels=self.CHANNELS, dtype="int16", blocksize=chunk_size, device=self.input_device) as stream:
-                while (time.time() - start_time) < max_duration:
-                    data, _ = stream.read(chunk_size)
-                    recorded_frames.append(data.tobytes())
-                    samples = np.frombuffer(data, dtype=np.int16).astype(np.float32)
-                    energy = np.sqrt(np.mean(samples ** 2)) if len(samples) > 0 else 0.0
+        with MIC_LOCK:
+            print("[STT][Mic] open", flush=True)
+            try:
+                with sd.InputStream(samplerate=self.SAMPLE_RATE, channels=self.CHANNELS, dtype="int16", blocksize=chunk_size, device=self.input_device) as stream:
+                    while (time.time() - start_time) < max_duration:
+                        if self._cancel_recording.is_set():
+                            print("[STT] 🛑 Đã nhận tín hiệu hủy ghi âm ngay lập tức!")
+                            return b""
+                        data, _ = stream.read(chunk_size)
+                        if self._cancel_recording.is_set():
+                            print("[STT] 🛑 Đã nhận tín hiệu hủy ghi âm ngay lập tức!")
+                            return b""
+                        chunk_bytes = data.tobytes()
+                        recorded_frames.append(chunk_bytes)
 
-                    if energy > speech_energy_threshold:
-                        speech_started = True
-                        silence_start = None
-                    elif speech_started:
-                        if silence_start is None:
-                            silence_start = time.time()
-                        elif (time.time() - silence_start) >= silence_limit:
-                            # Người dùng đã nói xong và phát hiện khoảng lặng 1.5s -> Kết thúc ghi âm
-                            print(f"[STT] Phát hiện khoảng lặng {silence_limit:.1f}s, kết thúc ghi âm.")
-                            break
-                    else:
-                        # Chưa bắt đầu nói: nếu quá 3.5s không có tiếng động -> dừng sớm
-                        if (time.time() - start_time) > 3.5:
-                            break
-        except Exception as exc:
-            print(f"[STT Cảnh báo record_wake_command]: {exc}")
-            return self.record_fixed(duration=3.5)
+                        # Bắt từ khóa ngắt ngang trực tiếp qua Vosk trong lúc đang thu âm (<2ms mỗi chunk)
+                        if vosk_interceptor is not None:
+                            try:
+                                if vosk_interceptor.AcceptWaveform(chunk_bytes):
+                                    res_txt = json.loads(vosk_interceptor.Result() or "{}").get("text", "")
+                                    if self.is_wake_word_intercept(res_txt):
+                                        print(f"\n[STT Realtime] ⚡ Bắt được 'Tèo đâu' trong lúc thu âm: \"{res_txt}\" -> Ngắt ngay!")
+                                        self._wake_interrupted = True
+                                        return b""
+                                else:
+                                    part_txt = json.loads(vosk_interceptor.PartialResult() or "{}").get("partial", "")
+                                    if self.is_wake_word_intercept(part_txt):
+                                        print(f"\n[STT Realtime] ⚡ Bắt được 'Tèo đâu' trong lúc thu âm: \"{part_txt}\" -> Ngắt ngay!")
+                                        self._wake_interrupted = True
+                                        return b""
+                            except Exception:
+                                pass
+
+                        samples = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+                        energy = np.sqrt(np.mean(samples ** 2)) if len(samples) > 0 else 0.0
+
+                        if energy > speech_energy_threshold:
+                            speech_started = True
+                            silence_start = None
+                        elif speech_started:
+                            if silence_start is None:
+                                silence_start = time.time()
+                            elif (time.time() - silence_start) >= silence_limit:
+                                # Người dùng đã nói xong và phát hiện khoảng lặng 1.5s -> Kết thúc ghi âm
+                                print(f"[STT] Phát hiện khoảng lặng {silence_limit:.1f}s, kết thúc ghi âm.")
+                                break
+                        else:
+                            # Chưa bắt đầu nói: nếu quá 3.5s không có tiếng động -> dừng sớm
+                            if (time.time() - start_time) > 3.5:
+                                break
+            except Exception as exc:
+                if self._cancel_recording.is_set():
+                    return b""
+                print(f"[STT Cảnh báo record_wake_command]: {exc}")
+                return self.record_fixed(duration=3.5)
+            finally:
+                print("[STT][Mic] close", flush=True)
 
         return b"".join(recorded_frames)
 
     def listen_command(self) -> str:
         """
         Lắng nghe câu lệnh rảnh tay (sau khi Wake Word đánh thức).
+        Bọc toàn bộ chu trình record + recognize trong try/finally,
+        trong finally luôn gọi wake_engine.resume() nếu trước đó đã pause.
         """
-        raw_audio = self.record_wake_command()
-        if not raw_audio:
-            return ""
-        return self.process_audio(raw_audio)
+        try:
+            raw_audio = self.record_wake_command()
+            if not raw_audio:
+                return ""
+            return self.process_audio(raw_audio)
+        finally:
+            if self.wake_engine is not None and hasattr(self.wake_engine, "resume"):
+                try:
+                    self.wake_engine.resume()
+                except Exception as exc:
+                    print(f"[STT Cảnh báo resume wake_engine]: {exc}", flush=True)
 
     def process_audio(self, raw_audio: bytes) -> str:
         """
@@ -455,7 +546,10 @@ class SpeechToText:
                     print("[STT] Không nghe thấy gì, vui lòng nói to hơn hoặc giữ phím lâu hơn")
                     return ""
 
-                print(f"[STT Online - Google STT ({elapsed}s)]: \"{clean_google}\"")
+                if self.is_wake_word_intercept(clean_google):
+                    print(f"[STT Online - Google STT ({elapsed}s)]: \"{clean_google}\" -> [⚡ Phát hiện Wake Word ngắt ngang!]")
+                else:
+                    print(f"[STT Online - Google STT ({elapsed}s)]: \"{clean_google}\"")
 
                 # KÍCH HOẠT LUỒNG NGẦM VOSK ĐỂ TỰ HỌC (CHỈ KHI CÓ KẾT QUẢ THẬT)
                 bg_thread = threading.Thread(

@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 import winsound
-from typing import Optional
+from typing import Any, Optional
 
 try:
     import psutil
@@ -196,6 +196,7 @@ class CommandProcessingWorker(QThread):
     update_status_sig = pyqtSignal(str)
     hide_overlay_sig = pyqtSignal()
     command_finished_sig = pyqtSignal()
+    retrigger_sig = pyqtSignal()
 
     def __init__(
         self,
@@ -204,149 +205,287 @@ class CommandProcessingWorker(QThread):
         executor: ActionExecutor,
         wake_engine: WakeWordEngine,
         parent: Optional[QObject] = None,
+        app_ref: Optional[Any] = None,
     ) -> None:
         super().__init__(parent)
         self.stt = stt
         self.brain = brain
         self.executor = executor
         self.wake_engine = wake_engine
+        self.app_ref = app_ref
         self._is_busy = False
+        self._abort_event = threading.Event()
+        self._cancel_token = self._abort_event
+        self._lock = threading.Lock()
+        self._is_retriggering = False
         self.last_activity_time = time.time()
+        self.last_progress_time = time.time()
+        self.last_stage = "INIT"
+        self.retrigger_sig.connect(lambda: self.trigger_command("teo"))
+
+    def touch(self, stage: str) -> None:
+        """Cập nhật mốc thời gian tiến triển của worker và ghi log [Worker][Touch]."""
+        self.last_progress_time = time.time()
+        self.last_activity_time = time.time()
+        self.last_stage = stage
+        print(f"[Worker][Touch] {stage}", flush=True)
 
     def ping_activity(self, message: str = "") -> None:
         """Cập nhật mốc thời gian hoạt động gần nhất để Watchdog biết hệ thống vẫn đang xử lý bình thường."""
         self.last_activity_time = time.time()
+        self.last_progress_time = time.time()
         if message:
             print(f"[Worker Activity] {message}", flush=True)
 
+    def abort_and_reset(self) -> None:
+        """
+        Lập tức hủy bỏ tiến trình xử lý hiện tại và giải phóng microphone.
+        Thực hiện theo 2 cấp độ:
+        1. Hủy hợp tác (Cooperative cancellation): Bật cờ ngắt và yêu cầu STT dừng thu âm ngay lập tức.
+        2. Cưỡng chế (Forced termination): Nếu sau 150ms luồng vẫn chưa thoát (kẹt mạng/C-lib),
+           gọi terminate() của QThread để giải phóng hoàn toàn mà không crash app.
+        """
+        print("[Worker] 🛑 Đang hủy tiến trình xử lý dở dang để nhường cho lệnh mới...")
+        self._abort_event.set()
+        try:
+            self.stt.cancel_recording()
+        except Exception as err:
+            print(f"[Worker Cảnh báo cancel STT]: {err}")
+
+        if self.isRunning():
+            self.wait(350)
+            if self.isRunning():
+                print("[Worker] ⚠️ Luồng xử lý không thoát sau 350ms -> Cưỡng chế dừng (terminate)...")
+                try:
+                    self.terminate()
+                    self.wait(200)
+                except Exception as exc:
+                    print(f"[Worker Cảnh báo terminate]: {exc}")
+
+        self._is_busy = False
+        self.last_activity_time = time.time()
+        self.last_progress_time = time.time()
+        print("[Worker] ✓ Đã reset hoàn tất Worker. Sẵn sàng xử lý lệnh mới.")
+
     def trigger_command(self, wake_word_name: str = "teo") -> None:
-        """Kích hoạt chạy luồng xử lý lệnh nếu chưa bận."""
-        if self.isRunning() or self._is_busy:
-            print("[Worker] Đang bận xử lý lệnh trước, bỏ qua trigger mới.")
-            return
-        self.start()
+        """
+        Kích hoạt chạy luồng xử lý lệnh khi phát hiện Wake Word.
+        Nếu đang bận hoặc luồng trước chưa xong -> LẬP TỨC HỦY TIẾN TRÌNH CŨ và reset để nghe lệnh mới.
+        """
+        with self._lock:
+            self._is_retriggering = False
+            if self.isRunning() or self._is_busy:
+                print("\n[Worker] ⚡ Nhận tín hiệu đánh thức mới trong khi đang xử lý! Tiến hành hủy và reset ngay...")
+                self.abort_and_reset()
+                time.sleep(0.05)
+
+            self._abort_event.clear()
+            self.start()
 
     def run(self) -> None:
         """
         Thực thi toàn bộ pipeline nhận diện và chạy hành động.
-        Cơ chế giám sát thông minh Watchdog 15 giây (chống treo cứng):
-        - Cập nhật liên tục self.last_activity_time mỗi khi STT, Brain hoặc Action có tiến triển.
-        - Luồng Watchdog kiểm tra định kỳ 1s: chỉ khi hệ thống bị treo hoàn toàn > 15s không có hoạt động
-          mới can thiệp kill tiến trình và reset micro.
-        - Nếu đang xử lý bình thường (có log/tiến triển), Watchdog để tác vụ chạy đến khi xong.
+        Bọc toàn bộ run() trong try/finally để đảm bảo luôn resume mic.
         """
-        self._is_busy = True
-        self.ping_activity("Khởi động chu trình xử lý lệnh")
-
-        stop_watchdog = threading.Event()
-        pipeline_finished = threading.Event()
-        is_hung = threading.Event()
-
-        def _watchdog_loop():
-            while not stop_watchdog.wait(1.0):
-                if pipeline_finished.is_set():
-                    break
-                elapsed = time.time() - self.last_activity_time
-                if elapsed > 15.0:
-                    is_hung.set()
-                    print(
-                        f"\n[Worker Watchdog] ⚠️ Phát hiện hệ thống không có tiến triển trong {elapsed:.1f}s! "
-                        f"Tiến hành reset lại Micro (KHÔNG kill tiến trình Brain để tránh ngắt dịch)..."
-                    )
-                    self.update_status_sig.emit("Hệ thống phản hồi chậm (Đang reset Micro)...")
-
-                    # Chỉ reset lại Microphone, TUYỆT ĐỐI KHÔNG kill tiến trình Brain/subprocess
-                    try:
-                        self.wake_engine.reset_microphone()
-                    except Exception as mic_err:
-                        print(f"[Worker Watchdog Cảnh báo reset micro]: {mic_err}")
-                    break
-
-        watchdog_thread = threading.Thread(
-            target=_watchdog_loop,
-            name="TeoWatchdogThread",
-            daemon=True,
-        )
-        watchdog_thread.start()
-
         try:
-            # 1. Mở Overlay và phát tiếng Bíp (chỉ khi Lớp 3 hoặc Lớp 4 đã xác thực thành công từ khóa)
-            self.show_overlay_sig.emit("Tèo đang lắng nghe...")
+            self._is_busy = True
+            if self.app_ref is not None:
+                self.app_ref.is_processing = True
+            self._abort_event.clear()
+            self.touch("WORKER_START")
+
+            stop_progress_watchdog = threading.Event()
+            pipeline_finished = threading.Event()
+
+            def _progress_watchdog_loop():
+                while not stop_progress_watchdog.wait(1.0):
+                    if pipeline_finished.is_set() or self._abort_event.is_set():
+                        break
+                    elapsed = time.time() - self.last_progress_time
+                    if elapsed > 20.0:
+                        print(
+                            f"\n[Worker][PANIC] Worker không có tiến triển {elapsed:.1f}s, stage cuối={self.last_stage}.",
+                            flush=True,
+                        )
+                        self._abort_event.set()
+                        if self.app_ref is not None and hasattr(self.app_ref, "trigger_panic_reset"):
+                            self.app_ref.trigger_panic_reset(reason=f"worker_stuck_20s_at_{self.last_stage}")
+                        break
+
+            progress_watchdog_thread = threading.Thread(
+                target=_progress_watchdog_loop,
+                name="ProgressWatchdogThread",
+                daemon=True,
+            )
+            progress_watchdog_thread.start()
+
+            pipeline_pool = None
             try:
-                winsound.Beep(1200, 180)  # Tần số 1200Hz, 180ms
-            except Exception:
-                pass
+                # 1. Khi Worker bắt đầu: gọi wake.pause() và chờ đến khi wake.is_stream_alive() == False (tối đa 0.5s) rồi mới cho STT mở mic
+                try:
+                    self.wake_engine.pause()
+                    t_wait = time.time()
+                    while self.wake_engine.is_stream_alive() and (time.time() - t_wait) < 0.5:
+                        time.sleep(0.02)
+                except Exception as pause_err:
+                    print(f"[Worker Cảnh báo pause wake]: {pause_err}", flush=True)
 
-            # 2. Thu âm câu lệnh qua STT Engine (silence_limit=1.5s, max_duration=6.0s)
-            print("\n[Tèo Assistant] 🎙️ Đang lắng nghe câu lệnh người dùng...")
-            self.ping_activity("Bắt đầu thu âm giọng nói...")
-            audio_bytes = self.stt.record_wake_command(max_duration=6.0, silence_limit=1.5)
-            self.ping_activity("Thu âm giọng nói hoàn tất")
+                # Mở Overlay và phát tiếng Bíp (chỉ khi Lớp 3 hoặc Lớp 4 đã xác thực thành công từ khóa)
+                self.show_overlay_sig.emit("Tèo đang lắng nghe...")
+                try:
+                    threading.Thread(target=winsound.Beep, args=(1200, 180), daemon=True).start()
+                except Exception:
+                    pass
 
-            if not audio_bytes:
-                self.update_status_sig.emit("Không nghe thấy lệnh...")
-                time.sleep(0.8)
-                return
-
-            def _pipeline_task():
-                # 3. Nhận diện giọng nói
-                self.update_status_sig.emit("Đang nhận diện giọng nói...")
-                self.ping_activity("Bắt đầu nhận diện STT")
-                user_text = self.stt.process_audio(audio_bytes)
-                self.ping_activity("STT nhận diện hoàn tất")
-
-                if not user_text or not user_text.strip():
-                    self.update_status_sig.emit("Không nghe rõ câu lệnh...")
-                    time.sleep(0.8)
+                if self._abort_event.is_set():
                     return
 
-                print(f"[Tèo Assistant 👤] Lệnh nhận diện: \"{user_text}\"")
-                self.update_status_sig.emit(f'"{user_text}"')
-                time.sleep(0.3)
+                # 2. Thu âm câu lệnh qua STT Engine (silence_limit=1.5s, max_duration=6.0s)
+                print("\n[Tèo Assistant] 🎙️ Đang lắng nghe câu lệnh người dùng...")
+                self.ping_activity("Bắt đầu thu âm giọng nói...")
+                audio_bytes = self.stt.record_wake_command(max_duration=6.0, silence_limit=1.5)
+                self.ping_activity("Thu âm giọng nói hoàn tất")
 
-                # 4. Phân tích ý định qua Bộ não
-                self.update_status_sig.emit("Đang thực thi lệnh...")
-                self.ping_activity(f"Bắt đầu phân tích ý định Brain: '{user_text}'")
-                t0 = time.time()
-                actions_list = self.brain.process(user_text)
-                elapsed = round(time.time() - t0, 3)
-                self.ping_activity(f"Brain phân tích xong ({elapsed}s)")
-                print(f"[Tèo Assistant 🧠] Ý định giải mã xong ({elapsed}s): {actions_list}")
-
-                # 5. Thực thi các hành động
-                if actions_list:
-                    self.ping_activity("Bắt đầu thực thi các hành động Action")
-                    self.executor.execute(actions_list)
-                    self.ping_activity("Thực thi các hành động hoàn tất")
-                    time.sleep(0.5)
-
-                print("[Tèo Assistant] ✓ Đã hoàn thành lệnh. Sẵn sàng lắng nghe từ khóa tiếp theo.")
-
-            # Thực thi pipeline và giám sát linh hoạt bằng Watchdog (Không dùng timeout 5s tuyệt đối)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(_pipeline_task)
-                while not future.done():
+                # STT đã xong phần thu âm micro -> Mở lại ngay luồng Wake Word để sẵn sàng đón interrupt!
+                if hasattr(self, "wake_engine") and self.wake_engine is not None and not self._abort_event.is_set():
                     try:
-                        future.result(timeout=0.5)
+                        self.wake_engine.resume()
+                    except Exception as res_err:
+                        print(f"[Worker Cảnh báo resume wake sau thu âm]: {res_err}", flush=True)
+
+                if self._abort_event.is_set():
+                    print("[Worker] Lệnh bị hủy ngang sau khi thu âm.")
+                    return
+
+                if not audio_bytes:
+                    if getattr(self.stt, "_wake_interrupted", False):
+                        print("\n[Worker] ⚡ Bắt được 'Tèo đâu' trực tiếp trong lúc thu âm! Kích hoạt lại chu trình nghe lệnh mới...")
+                        self.show_overlay_sig.emit("Tèo đang lắng nghe...")
+                        try:
+                            threading.Thread(target=winsound.Beep, args=(1200, 180), daemon=True).start()
+                        except Exception:
+                            pass
+                        self._is_retriggering = True
+                        self.retrigger_sig.emit()
+                        return
+
+                    if not self._abort_event.is_set():
+                        self.update_status_sig.emit("Không nghe thấy lệnh...")
+                        time.sleep(0.8)
+                    return
+
+                def _pipeline_task():
+                    if self._abort_event.is_set():
+                        return
+
+                    # 3. Nhận diện giọng nói
+                    self.update_status_sig.emit("Đang nhận diện giọng nói...")
+                    self.ping_activity("Bắt đầu nhận diện STT")
+                    user_text = self.stt.process_audio(audio_bytes)
+                    self.touch("STT_DONE")
+
+                    if self._abort_event.is_set():
+                        return
+
+                    if not user_text or not user_text.strip():
+                        if not self._abort_event.is_set():
+                            self.update_status_sig.emit("Không nghe rõ câu lệnh...")
+                            time.sleep(0.8)
+                        return
+
+                    # KIỂM TRA NGẮT NGANG: NẾU CÂU LỆNH CHỨA TỪ KHÓA WAKE WORD ("mở tèo đâu", "tèo đâu mở excel"...)
+                    if self.stt.is_wake_word_intercept(user_text):
+                        print(f"\n[Worker] ⚡ Phát hiện từ khóa 'Tèo đâu' xen kẽ trong câu lệnh: \"{user_text}\"!")
+                        print("[Worker] 🔄 Người dùng gọi lại để ngắt ngang -> Bỏ qua lệnh, kích hoạt lại trạng thái Wake Word!")
+                        self.show_overlay_sig.emit("Tèo đang lắng nghe...")
+                        try:
+                            threading.Thread(target=winsound.Beep, args=(1200, 180), daemon=True).start()
+                        except Exception:
+                            pass
+                        self._is_retriggering = True
+                        self.retrigger_sig.emit()
+                        return
+
+                    print(f"[Tèo Assistant 👤] Lệnh nhận diện: \"{user_text}\"")
+                    self.update_status_sig.emit(f'"{user_text}"')
+                    time.sleep(0.3)
+
+                    if self._abort_event.is_set():
+                        return
+
+                    # 4. Phân tích ý định qua Bộ não
+                    self.update_status_sig.emit("Đang thực thi lệnh...")
+                    self.ping_activity(f"Bắt đầu phân tích ý định Brain: '{user_text}'")
+                    t0 = time.time()
+                    actions_list = self.brain.process(user_text)
+                    elapsed = round(time.time() - t0, 3)
+                    self.touch("BRAIN_DONE")
+                    print(f"[Tèo Assistant 🧠] Ý định giải mã xong ({elapsed}s): {actions_list}")
+
+                    if self._abort_event.is_set():
+                        return
+
+                    # 5. Thực thi các hành động
+                    if actions_list:
+                        for item in actions_list:
+                            if self._abort_event.is_set():
+                                return
+                            name_val = item.get("name") or item.get("action", "action")
+                            self.touch(f"ACTION_START_{name_val}")
+                            self.executor.execute([item])
+                            self.touch(f"ACTION_DONE_{name_val}")
+                            time.sleep(0.1)
+
+                    self.touch("WORKER_END")
+                    print("[Tèo Assistant] ✓ Đã hoàn thành lệnh. Sẵn sàng lắng nghe từ khóa tiếp theo.")
+
+                # Thực thi pipeline và giám sát linh hoạt bằng Watchdog KHÔNG GÂY DEADLOCK
+                pipeline_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                future = pipeline_pool.submit(_pipeline_task)
+                while not future.done():
+                    if self._abort_event.is_set():
+                        print("[Worker] Phát hiện cờ hủy, thoát vòng lặp chờ pipeline.")
+                        break
+                    try:
+                        future.result(timeout=0.3)
                     except concurrent.futures.TimeoutError:
-                        if is_hung.is_set():
-                            print("[Worker] ⚠️ Watchdog báo treo cứng > 15s. Hủy chờ pipeline.")
+                        if self._abort_event.is_set():
                             break
 
+            finally:
+                pipeline_finished.set()
+                stop_progress_watchdog.set()
+                if pipeline_pool is not None:
+                    try:
+                        pipeline_pool.shutdown(wait=False, cancel_futures=True)
+                    except TypeError:
+                        pipeline_pool.shutdown(wait=False)
+                    except Exception:
+                        pass
+
+                # Chỉ ẩn overlay nếu không bị ngắt bởi trigger mới hoặc đang tái khởi động
+                if not self._abort_event.is_set() and not self._is_retriggering:
+                    self.hide_overlay_sig.emit()
+
         except Exception as exc:
-            print(f"[Tèo Assistant Lỗi Pipeline]: {exc}")
+            print(f"[Worker] Exception: {exc}", flush=True)
             import traceback
             traceback.print_exc()
         finally:
-            pipeline_finished.set()
-            stop_watchdog.set()
-            self.hide_overlay_sig.emit()
             self._is_busy = False
-            # Mở lại luồng lắng nghe Wake Word sau khi hoàn tất
-            try:
-                self.wake_engine.resume()
-            except Exception as res_err:
-                print(f"[Worker Cảnh báo resume]: {res_err}")
+            if self.app_ref is not None:
+                self.app_ref.is_processing = False
+            # Bọc toàn bộ run() trong try/finally. Trong finally luôn gọi self.wake_engine.resume() nếu wake_engine tồn tại.
+            if hasattr(self, "wake_engine") and self.wake_engine is not None and not self._abort_event.is_set():
+                try:
+                    self.wake_engine.resume()
+                except Exception as res_err:
+                    print(f"[Worker Cảnh báo resume]: {res_err}", flush=True)
+                print(
+                    f"[WakeWord][State] listening={bool(self.wake_engine.is_listening)}, "
+                    f"stream_alive={self.wake_engine.is_stream_alive()}",
+                    flush=True,
+                )
             self.command_finished_sig.emit()
 
 
@@ -386,30 +525,93 @@ class TeoAssistantApp:
         self.wake_engine = WakeWordEngine(
             wake_keyword="tèo đâu",
             on_detected=self._on_wake_word_triggered,
-            min_conf=0.60,
+            min_conf=0.65,
             fuzzy_threshold=70.0,
             voice_auth_threshold=0.80,
             min_rms=350.0,
+            dual_auth_min_rms=500.0,
+            silence_limit_sec=0.8,
             cooldown_sec=1.0,
             stt_verifier=self.stt.recognize_google,
         )
+        self.stt.set_wake_engine(self.wake_engine)
 
         # 5. Khởi tạo Worker xử lý giọng nói (QThread)
         print("[Tèo] [4/4] Đang kết nối luồng xử lý giọng nói CommandProcessingWorker...")
-        self.worker = CommandProcessingWorker(
+        self.panic_in_progress = False
+        self.is_processing = False
+        self.wake_triggered = False
+        self.worker = self._create_worker()
+
+        # 6. Cấu hình Khay hệ thống (System Tray Icon)
+        self._setup_system_tray()
+
+        # 7. Hotkey emergency (FIX 6: ctrl+shift+r)
+        try:
+            import keyboard
+            def _on_emergency_hotkey():
+                print("[EMERGENCY] Hotkey — chỉ dùng khi voice hoàn toàn không hoạt động.", flush=True)
+                self.trigger_panic_reset(reason="manual_hotkey")
+            keyboard.add_hotkey("ctrl+shift+r", _on_emergency_hotkey)
+        except Exception:
+            pass
+
+    def _create_worker(self) -> CommandProcessingWorker:
+        """Tạo đối tượng Worker mới với state sạch và kết nối các tín hiệu."""
+        worker = CommandProcessingWorker(
             stt=self.stt,
             brain=self.brain,
             executor=self.executor,
             wake_engine=self.wake_engine,
+            app_ref=self,
+        )
+        worker.show_overlay_sig.connect(self.overlay.show_overlay)
+        worker.update_status_sig.connect(self.overlay.set_status)
+        worker.hide_overlay_sig.connect(self.overlay.hide_overlay)
+        return worker
+
+    def trigger_panic_reset(self, reason: str = "unknown") -> None:
+        """Kích hoạt khôi phục hệ thống khi phát hiện treo hoặc kích hoạt khẩn cấp."""
+        if self.panic_in_progress:
+            return
+        self.panic_in_progress = True
+        worker_alive = self.worker.isRunning() if self.worker else False
+        wake_listening = bool(self.wake_engine.is_listening) if self.wake_engine else False
+        stream_alive = self.wake_engine.is_stream_alive() if self.wake_engine else False
+        print(
+            f"\n[PANIC RESET] reason={reason}, worker_alive={worker_alive}, "
+            f"wake_listening={wake_listening}, stream_alive={stream_alive}",
+            flush=True,
         )
 
-        # Kết nối tín hiệu từ Worker sang Overlay an toàn đa luồng
-        self.worker.show_overlay_sig.connect(self.overlay.show_overlay)
-        self.worker.update_status_sig.connect(self.overlay.set_status)
-        self.worker.hide_overlay_sig.connect(self.overlay.hide_overlay)
+        # Bước 1: Hủy worker nếu còn sống (set abort_event, join timeout=2.0, nếu vẫn alive thì log và tạo worker mới)
+        if self.worker and self.worker.isRunning():
+            self.worker._abort_event.set()
+            try:
+                self.stt.cancel_recording()
+            except Exception:
+                pass
+            self.worker.wait(2000)
+            if self.worker.isRunning():
+                print("[PANIC RESET] Worker vẫn còn alive sau 2s -> cưỡng chế dừng và tạo worker mới", flush=True)
+                try:
+                    self.worker.terminate()
+                    self.worker.wait(200)
+                except Exception:
+                    pass
+                self.worker = self._create_worker()
 
-        # 6. Cấu hình Khay hệ thống (System Tray Icon)
-        self._setup_system_tray()
+        # Bước 2: self.wake_engine.force_reset_stream()
+        if self.wake_engine:
+            self.wake_engine.force_reset_stream()
+
+        # Bước 3: self.is_processing=False, self.wake_triggered=False
+        self.is_processing = False
+        self.wake_triggered = False
+
+        # Bước 4: log [PANIC RESET] Hoàn tất, hệ thống sẵn sàng
+        print("[PANIC RESET] Hoàn tất, hệ thống sẵn sàng", flush=True)
+        self.panic_in_progress = False
 
     def _setup_system_tray(self) -> None:
         """Thiết lập biểu tượng và menu ngữ cảnh cho Khay hệ thống Windows."""
@@ -634,9 +836,44 @@ class TeoAssistantApp:
         except Exception as exc:
             print(f"[App Lỗi] Không thể mở file log: {exc}")
 
+    def interrupt_and_restart(self, model_name: str = "teo") -> None:
+        """
+        Ngắt ngang tiến trình worker hiện tại và tái khởi động với stream sạch:
+        - Trước khi tạo worker mới, gọi self.wake_engine.force_reset_stream()
+        - Sau force_reset_stream, mới tạo worker mới và gọi wake_engine.resume()
+        """
+        print("[Interrupt] Wake word kích hoạt trong lúc worker_busy=True", flush=True)
+        self.worker._abort_event.set()
+        try:
+            self.stt.cancel_recording()
+        except Exception:
+            pass
+
+        # Trước khi tạo worker mới, gọi self.wake_engine.force_reset_stream()
+        if self.wake_engine is not None:
+            self.wake_engine.force_reset_stream()
+
+        # Sau force_reset_stream, mới tạo worker mới và gọi wake_engine.resume()
+        self.worker = self._create_worker()
+        print("[Interrupt] Đã tạo worker mới", flush=True)
+
+        if self.wake_engine is not None:
+            try:
+                self.wake_engine.resume()
+            except Exception as res_err:
+                print(f"[Interrupt Cảnh báo resume]: {res_err}", flush=True)
+
+        print(f"\n[App] 🔔 Nhận tín hiệu Wake Word: '{model_name}' -> Kích hoạt Worker!", flush=True)
+        self.worker.trigger_command(model_name)
+
     def _on_wake_word_triggered(self, model_name: str, score: float) -> None:
         """Hàm callback được gọi từ luồng Vosk Wake Word khi phát hiện từ khóa."""
-        print(f"\n[App] 🔔 Nhận tín hiệu Wake Word: '{model_name}' -> Kích hoạt Worker!")
+        worker_busy = self.worker.isRunning() or getattr(self.worker, "_is_busy", False) or getattr(self, "is_processing", False)
+        if worker_busy:
+            self.interrupt_and_restart(model_name)
+            return
+
+        print(f"\n[App] 🔔 Nhận tín hiệu Wake Word: '{model_name}' -> Kích hoạt Worker!", flush=True)
         self.worker.trigger_command(model_name)
 
     def _toggle_wake_word(self, checked: bool) -> None:
