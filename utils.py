@@ -197,7 +197,7 @@ class StreamToLogger:
 
 def setup_file_logging(
     log_filename: str = "teo_debug.log",
-    max_bytes: int = 3 * 1024 * 1024,  # Giới hạn 3 MB mỗi file log
+    max_bytes: int = 5 * 1024 * 1024,  # Giới hạn 5 MB mỗi file log
     backup_count: int = 2,              # Giữ tối đa 2 file cũ (.1, .2)
 ) -> str:
     """
