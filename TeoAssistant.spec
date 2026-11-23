@@ -27,12 +27,14 @@ datas += collect_data_files('vosk')
 datas += collect_data_files('resemblyzer')
 
 # Gom các file dữ liệu cục bộ vào thư mục phân phối
+# - da.wav: Âm thanh phản hồi Wake Word ("Dạ")
 # - memory.json: Bộ nhớ đệm Fast Path
 # - learned_phonetics.json: Từ lóng / phiên âm
 # - offline_learning.json: Từ điển tự học Vosk
 # - my_voice.pkl: Hồ sơ sinh trắc học giọng nói chủ nhân
 # - model: Thư mục mô hình Vosk Offline tiếng Việt
 local_assets = [
+    ('da.wav', '.'),
     ('memory.json', '.'),
     ('learned_phonetics.json', '.'),
     ('offline_learning.json', '.'),
@@ -56,6 +58,7 @@ hiddenimports = [
     'PyQt6.QtCore',
     'PyQt6.QtGui',
     'PyQt6.QtWidgets',
+    'PyQt6.QtMultimedia',
     'PyQt6.sip',
 
     # Thu âm và nhận diện giọng nói

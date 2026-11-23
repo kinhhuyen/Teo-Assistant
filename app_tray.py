@@ -15,10 +15,10 @@ import concurrent.futures
 import ctypes
 import os
 import socket
+from pathlib import Path
 import sys
 import threading
 import time
-import winsound
 from typing import Any, Optional
 
 try:
@@ -125,7 +125,16 @@ if __name__ == "__main__":
             pass
         sys.exit(0)
 
-from PyQt6.QtCore import QObject, QThread, QTimer, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import (
+    QMetaObject,
+    QObject,
+    QThread,
+    QTimer,
+    QUrl,
+    Qt,
+    pyqtSignal,
+    pyqtSlot,
+)
 from PyQt6.QtGui import (
     QAction,
     QActionGroup,
@@ -137,6 +146,7 @@ from PyQt6.QtGui import (
     QPainter,
     QPixmap,
 )
+from PyQt6.QtMultimedia import QSoundEffect
 from PyQt6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 
 from actions import ActionExecutor
@@ -148,10 +158,90 @@ from utils import (
     get_configured_microphone,
     get_exe_dir,
     is_autostart_enabled,
+    resource_path,
     set_autostart,
     set_configured_microphone,
 )
 from wake_word_engine import WakeWordEngine
+
+# =============================================================================
+# ÂM THANH PHẢN HỒI WAKE WORD ("DẠ" - da.wav)
+# =============================================================================
+_WAKE_SOUND_EFFECT: Optional[QSoundEffect] = None
+
+
+def get_wake_sound_path() -> str:
+    """
+    Xác định đường dẫn chính xác đến tệp âm thanh da.wav:
+    - Khi đóng gói PyInstaller (.exe): Hỗ trợ sys._MEIPASS (_internal) và thư mục chứa file .exe.
+    - Khi chạy mã nguồn: Lấy từ thư mục gốc dự án.
+    """
+    # 1. Thử qua resource_path (hỗ trợ sys._MEIPASS khi đóng gói PyInstaller)
+    try:
+        p = resource_path("da.wav")
+        if os.path.exists(p):
+            return os.path.abspath(p)
+    except Exception:
+        pass
+
+    # 2. Thử qua get_exe_dir (thư mục chứa file .exe hoặc script)
+    try:
+        p_exe = get_exe_dir() / "da.wav"
+        if p_exe.exists():
+            return str(p_exe.resolve())
+    except Exception:
+        pass
+
+    # 3. sys._MEIPASS trực tiếp
+    if hasattr(sys, "_MEIPASS"):
+        meipass_p = os.path.join(sys._MEIPASS, "da.wav")
+        if os.path.exists(meipass_p):
+            return os.path.abspath(meipass_p)
+
+    return str((Path(__file__).resolve().parent / "da.wav").resolve())
+
+
+def init_wake_sound() -> Optional[QSoundEffect]:
+    """
+    Khởi tạo và nạp sẵn đối tượng QSoundEffect vào bộ nhớ trên luồng Qt chính.
+    Việc nạp trước giúp âm thanh phát ra ngay lập tức (0ms độ trễ) khi phát hiện Wake Word.
+    """
+    global _WAKE_SOUND_EFFECT
+    try:
+        if _WAKE_SOUND_EFFECT is None:
+            sound_path = get_wake_sound_path()
+            if not os.path.exists(sound_path):
+                print(f"[Sound Cảnh báo] Không tìm thấy tệp âm thanh 'da.wav' tại: {sound_path}", flush=True)
+                return None
+
+            effect = QSoundEffect()
+            effect.setSource(QUrl.fromLocalFile(sound_path))
+            effect.setVolume(1.0)
+            _WAKE_SOUND_EFFECT = effect
+            print(f"[Sound] Đã nạp thành công âm thanh Wake Word: '{sound_path}'", flush=True)
+    except Exception as exc:
+        print(f"[Sound Lỗi] Không thể nạp âm thanh wake sound: {exc}", flush=True)
+    return _WAKE_SOUND_EFFECT
+
+
+def play_wake_sound() -> None:
+    """
+    Phát âm thanh 'Dạ' (da.wav) cực nhanh bằng QSoundEffect, hoàn toàn không gây block
+    luồng chính hay luồng thu âm, an toàn khi gọi từ bất kỳ thread nào.
+    """
+    global _WAKE_SOUND_EFFECT
+    try:
+        if _WAKE_SOUND_EFFECT is None:
+            init_wake_sound()
+
+        if _WAKE_SOUND_EFFECT is not None:
+            # An toàn trên mọi luồng: gọi trực tiếp nếu trên main thread, invoke qua QueuedConnection nếu từ worker thread
+            if QThread.currentThread() == _WAKE_SOUND_EFFECT.thread():
+                _WAKE_SOUND_EFFECT.play()
+            else:
+                QMetaObject.invokeMethod(_WAKE_SOUND_EFFECT, "play", Qt.ConnectionType.QueuedConnection)
+    except Exception as exc:
+        print(f"[Sound Cảnh báo] Lỗi khi phát âm thanh wake: {exc}", flush=True)
 
 
 def create_tray_icon() -> QIcon:
@@ -330,12 +420,9 @@ class CommandProcessingWorker(QThread):
                 except Exception as pause_err:
                     print(f"[Worker Cảnh báo pause wake]: {pause_err}", flush=True)
 
-                # Mở Overlay và phát tiếng Bíp (chỉ khi Lớp 3 hoặc Lớp 4 đã xác thực thành công từ khóa)
+                # Mở Overlay và phát âm thanh "Dạ" (da.wav)
                 self.show_overlay_sig.emit("Tèo đang lắng nghe...")
-                try:
-                    threading.Thread(target=winsound.Beep, args=(1200, 180), daemon=True).start()
-                except Exception:
-                    pass
+                play_wake_sound()
 
                 if self._abort_event.is_set():
                     return
@@ -361,10 +448,7 @@ class CommandProcessingWorker(QThread):
                     if getattr(self.stt, "_wake_interrupted", False):
                         print("\n[Worker] ⚡ Bắt được 'Tèo đâu' trực tiếp trong lúc thu âm! Kích hoạt lại chu trình nghe lệnh mới...")
                         self.show_overlay_sig.emit("Tèo đang lắng nghe...")
-                        try:
-                            threading.Thread(target=winsound.Beep, args=(1200, 180), daemon=True).start()
-                        except Exception:
-                            pass
+                        play_wake_sound()
                         self._is_retriggering = True
                         self.retrigger_sig.emit()
                         return
@@ -398,10 +482,7 @@ class CommandProcessingWorker(QThread):
                         print(f"\n[Worker] ⚡ Phát hiện từ khóa 'Tèo đâu' xen kẽ trong câu lệnh: \"{user_text}\"!")
                         print("[Worker] 🔄 Người dùng gọi lại để ngắt ngang -> Bỏ qua lệnh, kích hoạt lại trạng thái Wake Word!")
                         self.show_overlay_sig.emit("Tèo đang lắng nghe...")
-                        try:
-                            threading.Thread(target=winsound.Beep, args=(1200, 180), daemon=True).start()
-                        except Exception:
-                            pass
+                        play_wake_sound()
                         self._is_retriggering = True
                         self.retrigger_sig.emit()
                         return
@@ -509,6 +590,9 @@ class TeoAssistantApp:
         print("\n" + "=" * 68)
         print("     KHỞI ĐỘNG TÈO ASSISTANT v1.2.0 (VOSK WAKE WORD & TRAY OVERLAY)")
         print("=" * 68)
+
+        # Nạp trước hiệu ứng âm thanh Wake Word ("Dạ" - da.wav)
+        init_wake_sound()
 
         # 2. Khởi tạo Giao diện Overlay
         print("[Tèo] [1/4] Đang khởi tạo giao diện Glow Orb Overlay...")
@@ -886,8 +970,9 @@ class TeoAssistantApp:
             print("[App] Đã tạm dừng tính năng lắng nghe Wake Word.")
 
     def _test_show_overlay(self) -> None:
-        """Hiển thị overlay thử nghiệm trong 3 giây."""
+        """Hiển thị overlay thử nghiệm trong 3 giây kèm âm thanh wake word."""
         self.overlay.show_overlay("Tèo đang thử nghiệm...")
+        play_wake_sound()
         QTimer.singleShot(3000, self.overlay.hide_overlay)
 
     def start(self) -> None:
