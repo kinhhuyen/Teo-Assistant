@@ -10,6 +10,7 @@ Công nghệ:
     4. Offline Fallback: Khi mất mạng, tự động đưa audio cho Vosk xử lý và áp dụng từ điển tự học.
 """
 
+import collections
 import concurrent.futures
 import json
 import os
@@ -35,12 +36,24 @@ try:
 except ImportError:
     HAS_SPEECH_RECOGNITION = False
 
-# 2. Thư viện Vosk (Offline STT)
+# 2. Thư viện Silero VAD (Phát hiện tiếng nói chuẩn xác cho thu âm câu lệnh)
+HAS_SILERO_VAD = False
+try:
+    import torch
+    from silero_vad import load_silero_vad
+    HAS_SILERO_VAD = True
+except ImportError:
+    torch = None
+    load_silero_vad = None
+    HAS_SILERO_VAD = False
+
+# 2b. Thư viện Vosk (giữ cờ tương thích ngược, không nạp Model để tiết kiệm RAM)
 HAS_VOSK = False
 try:
     import vosk
     HAS_VOSK = True
 except ImportError:
+    vosk = None
     HAS_VOSK = False
 
 # 3. Thư viện keyboard (Push-to-Talk Ctrl+Space)
@@ -97,21 +110,19 @@ class SpeechToText:
             self.recognizer = None
             print("[STT Cảnh báo] Chưa cài đặt 'speech_recognition'! Cần pip install SpeechRecognition")
 
-        # Khởi tạo mô hình Vosk Offline (Pre-load sẵn vào RAM)
+        # TUYỆT ĐỐI KHÔNG nạp Vosk lúc khởi động (Lazy-Load qua utils.get_vosk_model() CHỈ khi mất mạng)
         self.vosk_model = None
-        if HAS_VOSK:
+        self._vosk_model_path = vosk_model_path
+
+        # Khởi tạo Silero VAD riêng cho STT (PyTorch onnx=False, 512 samples/32ms)
+        self.silero_vad = None
+        if HAS_SILERO_VAD and load_silero_vad is not None:
             try:
-                vosk.SetLogLevel(-1)  # Tắt log Kaldi rườm rà
-                from utils import get_vosk_model_path
-                resolved_model_path = get_vosk_model_path(vosk_model_path)
-                self.vosk_model = vosk.Model(resolved_model_path)
-                model_name = Path(resolved_model_path).name
-                print(f"[STT] ✓ Đã nạp thành công mô hình Vosk tiếng Việt: '{model_name}'.")
-            except Exception as exc:
-                print(f"[STT Cảnh báo] Không thể khởi tạo mô hình Vosk: {exc}")
-                self.vosk_model = None
-        else:
-            print("[STT Cảnh báo] Chưa cài đặt thư viện 'vosk'! Cần pip install vosk")
+                self.silero_vad = load_silero_vad(onnx=False)
+                print("[STT] ✓ Đã kích hoạt Silero VAD (PyTorch CPU, 512 samples/32ms) cho thu âm câu lệnh.")
+            except Exception as vad_exc:
+                print(f"[STT Cảnh báo] Không thể nạp Silero VAD ({vad_exc}), dùng ngưỡng RMS dự phòng.")
+                self.silero_vad = None
 
         if not HAS_KEYBOARD:
             print("[STT Cảnh báo] Chưa cài đặt thư viện 'keyboard'! Cần pip install keyboard")
@@ -251,15 +262,41 @@ class SpeechToText:
             except sr.RequestError as exc:
                 raise ConnectionError(f"Google STT Service không khả dụng: {exc}") from exc
 
+    @staticmethod
+    def _preprocess_for_vosk(raw_audio: bytes) -> bytes:
+        """Khử DC offset + khuếch đại nhẹ mục tiêu RMS ~ 3000 (trần 6.0x) để Vosk nghe rõ tiếng từ mic laptop."""
+        if not raw_audio or len(raw_audio) < 640:
+            return raw_audio
+        try:
+            usable_len = len(raw_audio) - (len(raw_audio) % 2)
+            samples = np.frombuffer(raw_audio[:usable_len], dtype=np.int16).astype(np.float32)
+            if samples.size == 0:
+                return raw_audio
+            samples = samples - float(np.mean(samples))
+            rms = float(np.sqrt(np.mean(samples ** 2)))
+            if 1.0 < rms < 3000.0:
+                gain = min(6.0, 3000.0 / max(rms, 1.0))
+                samples = samples * gain
+            return np.clip(samples, -32768.0, 32767.0).astype(np.int16).tobytes()
+        except Exception:
+            return raw_audio
+
     def recognize_vosk(self, raw_audio: bytes) -> str:
         """
-        Nhận diện âm thanh ngoại tuyến sử dụng mô hình Vosk (KaldiRecognizer).
+        Nhận diện âm thanh ngoại tuyến sử dụng mô hình Vosk Singleton Lazy-Load (chỉ nạp khi mất mạng).
         """
-        if not self.vosk_model or not raw_audio:
+        if not raw_audio:
+            return ""
+        if self.vosk_model is None:
+            from utils import get_vosk_model
+            self.vosk_model = get_vosk_model(self._vosk_model_path)
+        if not self.vosk_model:
             return ""
         try:
-            rec = vosk.KaldiRecognizer(self.vosk_model, self.SAMPLE_RATE)
-            rec.AcceptWaveform(raw_audio)
+            import vosk as _vosk
+            vosk_audio = self._preprocess_for_vosk(raw_audio)
+            rec = _vosk.KaldiRecognizer(self.vosk_model, self.SAMPLE_RATE)
+            rec.AcceptWaveform(vosk_audio)
             res = json.loads(rec.FinalResult())
             return str(res.get("text", "")).strip()
         except Exception as exc:
@@ -405,31 +442,24 @@ class SpeechToText:
     def record_wake_command(self, max_duration: float = 6.0, silence_limit: float = 1.5) -> bytes:
         """
         Thu âm thông minh sau khi đánh thức bằng Wake Word:
-        - Lắng nghe khi người dùng bắt đầu nói.
+        - Silero VAD (512 samples = 32ms ở 16kHz, reset_states đầu/cuối phiên) kết hợp ngưỡng sàn RMS 120.0.
+        - Đệm sẵn pre_roll ~256ms (8 blocks) trước khi bắt đầu nói để không bao giờ cắt chữ đầu ('Mở', 'Tắt').
         - Tự động ngắt khi phát hiện khoảng lặng (silence_limit = 1.5s) sau khi đã nói xong.
-        - Cho phép người dùng ngập ngừng lấy hơi 1.0s mà không bị cắt ngang câu lệnh.
-        - Tối đa max_duration (6.0s) để tránh treo nếu môi trường có tiếng ồn nền.
-        - Tích hợp giám sát thời gian thực bằng Vosk: nếu phát hiện người dùng nói 'Tèo đâu' ngắt ngang
-          trong lúc đang thu âm, lập tức dừng ngay mà không cần chờ hết câu.
+        - Tối đa max_duration (6.0s).
         """
         self._cancel_recording.clear()
         self._wake_interrupted = False
         self.check_microphone()
-        chunk_size = self.CHUNK_SIZE
+
+        use_silero = self.silero_vad is not None and torch is not None
+        block_size = 512 if use_silero else self.CHUNK_SIZE
+        pre_roll: collections.deque = collections.deque(maxlen=8)  # 8 x 32ms = 256ms pre-roll
         recorded_frames = []
         speech_started = False
         silence_start = None
         start_time = time.time()
-        speech_energy_threshold = 280.0  # RMS threshold cho giọng nói người (nói bình thường/nhỏ là nhận)
-
-        # Bộ giám sát Vosk nhẹ để bắt từ khóa 'tèo đâu' trực tiếp trong lúc đang thu âm
-        vosk_interceptor = None
-        if self.vosk_model is not None:
-            try:
-                vosk_interceptor = vosk.KaldiRecognizer(self.vosk_model, float(self.SAMPLE_RATE))
-                vosk_interceptor.SetWords(False)
-            except Exception:
-                vosk_interceptor = None
+        silero_min_rms = 120.0
+        speech_energy_threshold = 160.0  # Dự phòng nếu không có Silero VAD
 
         # Không mở InputStream mới nếu wake engine chưa close stream (chờ tối đa 0.5s)
         if self.wake_engine is not None and hasattr(self.wake_engine, "is_stream_alive"):
@@ -437,65 +467,87 @@ class SpeechToText:
             while self.wake_engine.is_stream_alive() and (time.time() - t_wait) < 0.5:
                 time.sleep(0.02)
 
+        if use_silero:
+            try:
+                self.silero_vad.reset_states()
+            except Exception:
+                pass
+
         print("[STT] Đang nghe...")
         with MIC_LOCK:
             print("[STT][Mic] open", flush=True)
             try:
-                with sd.InputStream(samplerate=self.SAMPLE_RATE, channels=self.CHANNELS, dtype="int16", blocksize=chunk_size, device=self.input_device) as stream:
+                with sd.InputStream(
+                    samplerate=self.SAMPLE_RATE,
+                    channels=self.CHANNELS,
+                    dtype="int16",
+                    blocksize=block_size,
+                    device=self.input_device,
+                ) as stream:
                     while (time.time() - start_time) < max_duration:
                         if self._cancel_recording.is_set():
                             print("[STT] 🛑 Đã nhận tín hiệu hủy ghi âm ngay lập tức!")
                             return b""
-                        data, _ = stream.read(chunk_size)
+                        data, _ = stream.read(block_size)
                         if self._cancel_recording.is_set():
                             print("[STT] 🛑 Đã nhận tín hiệu hủy ghi âm ngay lập tức!")
                             return b""
                         chunk_bytes = data.tobytes()
-                        recorded_frames.append(chunk_bytes)
-
-                        # Bắt từ khóa ngắt ngang trực tiếp qua Vosk trong lúc đang thu âm (<2ms mỗi chunk)
-                        if vosk_interceptor is not None:
-                            try:
-                                if vosk_interceptor.AcceptWaveform(chunk_bytes):
-                                    res_txt = json.loads(vosk_interceptor.Result() or "{}").get("text", "")
-                                    if self.is_wake_word_intercept(res_txt):
-                                        print(f"\n[STT Realtime] ⚡ Bắt được 'Tèo đâu' trong lúc thu âm: \"{res_txt}\" -> Ngắt ngay!")
-                                        self._wake_interrupted = True
-                                        return b""
-                                else:
-                                    part_txt = json.loads(vosk_interceptor.PartialResult() or "{}").get("partial", "")
-                                    if self.is_wake_word_intercept(part_txt):
-                                        print(f"\n[STT Realtime] ⚡ Bắt được 'Tèo đâu' trong lúc thu âm: \"{part_txt}\" -> Ngắt ngay!")
-                                        self._wake_interrupted = True
-                                        return b""
-                            except Exception:
-                                pass
 
                         samples = np.frombuffer(data, dtype=np.int16).astype(np.float32)
-                        energy = np.sqrt(np.mean(samples ** 2)) if len(samples) > 0 else 0.0
+                        energy = float(np.sqrt(np.mean(samples ** 2))) if len(samples) > 0 else 0.0
 
-                        if energy > speech_energy_threshold:
-                            speech_started = True
-                            silence_start = None
-                        elif speech_started:
-                            if silence_start is None:
-                                silence_start = time.time()
-                            elif (time.time() - silence_start) >= silence_limit:
-                                # Người dùng đã nói xong và phát hiện khoảng lặng 1.5s -> Kết thúc ghi âm
-                                print(f"[STT] Phát hiện khoảng lặng {silence_limit:.1f}s, kết thúc ghi âm.")
-                                break
+                        if use_silero and samples.size == 512:
+                            try:
+                                tensor = torch.from_numpy(samples / 32768.0)
+                                with torch.no_grad():
+                                    prob = float(self.silero_vad(tensor, self.SAMPLE_RATE).item())
+                            except Exception:
+                                prob = 0.0
+                            if not speech_started:
+                                is_speech = (prob >= 0.50) and (energy >= silero_min_rms)
+                            else:
+                                is_speech = prob >= 0.35
                         else:
-                            # Chưa bắt đầu nói: nếu quá 3.5s không có tiếng động -> dừng sớm
-                            if (time.time() - start_time) > 3.5:
-                                break
+                            is_speech = energy > speech_energy_threshold
+
+                        if not speech_started:
+                            if is_speech:
+                                speech_started = True
+                                silence_start = None
+                                recorded_frames.extend(pre_roll)
+                                recorded_frames.append(chunk_bytes)
+                                pre_roll.clear()
+                            else:
+                                pre_roll.append(chunk_bytes)
+                                # Chưa bắt đầu nói: nếu quá 3.5s không có tiếng người -> dừng sớm
+                                if (time.time() - start_time) > 3.5:
+                                    break
+                        else:
+                            recorded_frames.append(chunk_bytes)
+                            if is_speech:
+                                silence_start = None
+                            else:
+                                if silence_start is None:
+                                    silence_start = time.time()
+                                elif (time.time() - silence_start) >= silence_limit:
+                                    print(f"[STT] Phát hiện khoảng lặng {silence_limit:.1f}s, kết thúc ghi âm.")
+                                    break
             except Exception as exc:
                 if self._cancel_recording.is_set():
                     return b""
                 print(f"[STT Cảnh báo record_wake_command]: {exc}")
                 return self.record_fixed(duration=3.5)
             finally:
+                if use_silero:
+                    try:
+                        self.silero_vad.reset_states()
+                    except Exception:
+                        pass
                 print("[STT][Mic] close", flush=True)
 
+        if not speech_started:
+            return b""
         return b"".join(recorded_frames)
 
     def listen_command(self) -> str:
@@ -518,30 +570,30 @@ class SpeechToText:
 
     def process_audio(self, raw_audio: bytes) -> str:
         """
-        Xử lý đoạn âm thanh theo kiến trúc Hybrid:
-        - Có mạng: Gửi Google STT lấy kết quả trả về NGAY LẬP TỨC.
-                   Đồng thời dùng threading chạy NGẦM Vosk để tự học.
-        - Mất mạng: Nhận diện bằng Vosk Offline, áp dụng từ điển tự học và trả về kết quả.
+        Xử lý đoạn âm thanh gọn nhẹ (0 GB VRAM, 0 MB RAM cho Vosk khi Online):
+        - Có mạng (Online): Đệm 150ms im lặng hai đầu (không peak normalize) rồi gọi Google STT (timeout=2.5s)
+          trả kết quả ngay lập tức. KHÔNG khởi chạy luồng ngầm Vosk khi Online.
+          Nếu Google trả rỗng "" -> trả "", không gọi Vosk.
+        - Mất mạng (Offline) hoặc Google TimeoutError/ConnectionError:
+          Lazy-load 1 bản Vosk dùng chung qua `recognize_vosk()` + áp dụng `apply_offline_learning(...)`.
         """
         if not raw_audio:
             print("[STT] Không nghe thấy gì, vui lòng nói to hơn hoặc giữ phím lâu hơn")
             return ""
 
-        online = self.is_online()
-
-        if online:
+        if self.is_online():
             # =================================================================
-            # CHẾ ĐỘ CÓ MẠNG (ONLINE): GOOGLE STT + LUỒNG NGẦM VOSK TỰ HỌC
+            # CHẾ ĐỘ CÓ MẠNG (ONLINE): GOOGLE STT SẠCH (KHÔNG NẠP VOSK)
             # =================================================================
             try:
+                pad_bytes = b"\x00" * (int(self.SAMPLE_RATE * 0.15) * 2)
+                padded_audio = pad_bytes + raw_audio + pad_bytes
+
                 t0 = time.time()
-                google_text = self.recognize_google(raw_audio)
+                google_text = self.recognize_google(padded_audio, timeout=2.5)
                 elapsed = round(time.time() - t0, 3)
 
                 clean_google = google_text.strip() if google_text else ""
-
-                # Nếu kết quả từ Google STT trả về chuỗi rỗng "" hoặc khoảng trắng:
-                # In thông báo và BỎ QUA, TUYỆT ĐỐI không gửi cho Vosk (để tránh Vosk tự bịa ra "mưa bất chợt")
                 if not clean_google:
                     print("[STT] Không nghe thấy gì, vui lòng nói to hơn hoặc giữ phím lâu hơn")
                     return ""
@@ -551,27 +603,15 @@ class SpeechToText:
                 else:
                     print(f"[STT Online - Google STT ({elapsed}s)]: \"{clean_google}\"")
 
-                # KÍCH HOẠT LUỒNG NGẦM VOSK ĐỂ TỰ HỌC (CHỈ KHI CÓ KẾT QUẢ THẬT)
-                bg_thread = threading.Thread(
-                    target=self._run_vosk_background,
-                    args=(raw_audio, clean_google),
-                    daemon=True,
-                    name="VoskAutoLearnThread",
-                )
-                bg_thread.start()
-
-                # TRẢ VỀ KẾT QUẢ NGAY LẬP TỨC CHO BỘ NÃO XỬ LÝ (TỐC ĐỘ < 1s)
                 return clean_google
 
             except (TimeoutError, ConnectionError) as conn_err:
-                print(f"[STT Cảnh báo] Google STT quá 2s hoặc mất kết nối ({conn_err}). Lập tức chuyển sang Vosk Offline...")
-                # Rơi xuống xử lý Offline bên dưới
+                print(f"[STT Cảnh báo] Google STT quá hạn hoặc mất kết nối ({conn_err}). Chuyển sang Vosk Offline...")
             except Exception as exc:
                 print(f"[STT Cảnh báo] Google STT gặp sự cố ({exc}). Chuyển sang Vosk Offline...")
-                # Rơi xuống xử lý Offline bên dưới
 
         # =====================================================================
-        # CHẾ ĐỘ MẤT MẠNG (OFFLINE): VOSK + TỪ ĐIỂN TỰ HỌC OFFLINE_LEARNING.JSON
+        # CHẾ ĐỘ MẤT MẠNG (OFFLINE): VOSK LAZY-LOAD + TỪ ĐIỂN TỰ HỌC
         # =====================================================================
         print("[STT: OFFLINE] Đang nhận diện ngoại tuyến bằng mô hình Vosk...")
         t0 = time.time()
@@ -584,7 +624,6 @@ class SpeechToText:
             print("[STT] Không nghe thấy gì, vui lòng nói to hơn hoặc giữ phím lâu hơn")
             return ""
 
-        # Áp dụng từ điển tự học từ offline_learning.json
         final_text = apply_offline_learning(clean_vosk)
         if final_text != clean_vosk:
             print(f"[STT Offline] Đã áp dụng từ điển tự học: \"{clean_vosk}\" -> \"{final_text}\"")

@@ -115,6 +115,46 @@ def get_vosk_model_path(custom_path: Optional[str] = None) -> str:
     return resource_path("model")
 
 
+# Singleton Vosk Model (Lazy-Load — CHỈ nạp đúng 1 lần khi mất mạng thực sự)
+_SHARED_VOSK_MODEL: Any = None
+_VOSK_MODEL_LOCK = threading.Lock()
+
+
+def get_vosk_model(custom_path: Optional[str] = None) -> Any:
+    """
+    Trả về 1 thể hiện duy nhất của vosk.Model dùng chung cho cả WakeWordEngine và SpeechToText.
+    TUYỆT ĐỐI không nạp lúc import/khởi động; chỉ tự động nạp đúng 1 lần khi gọi thực sự (mất mạng).
+    """
+    global _SHARED_VOSK_MODEL
+    if _SHARED_VOSK_MODEL is not None:
+        return _SHARED_VOSK_MODEL
+
+    with _VOSK_MODEL_LOCK:
+        if _SHARED_VOSK_MODEL is not None:
+            return _SHARED_VOSK_MODEL
+
+        try:
+            import vosk
+        except ImportError:
+            print("[Vosk Fallback Cảnh báo] Chưa cài đặt thư viện 'vosk'.", flush=True)
+            return None
+
+        resolved_path = get_vosk_model_path(custom_path)
+        model_name = Path(resolved_path).name
+        print(
+            f"[Vosk Fallback] 🛟 Mất mạng — Đang tự động nạp lốp dự phòng Vosk Offline ('{model_name}')...",
+            flush=True,
+        )
+        try:
+            vosk.SetLogLevel(-1)
+            _SHARED_VOSK_MODEL = vosk.Model(resolved_path)
+            print(f"[Vosk Fallback] ✓ Đã nạp thành công Vosk Offline ('{model_name}').", flush=True)
+            return _SHARED_VOSK_MODEL
+        except Exception as exc:
+            print(f"[Vosk Fallback Lỗi] Không thể nạp mô hình Vosk '{model_name}': {exc}", flush=True)
+            return None
+
+
 def get_data_path(relative_path: Union[str, Path], default_content: str = "{}") -> str:
     """
     Lấy đường dẫn tuyệt đối đến file dữ liệu đọc/ghi (JSON learning, memory, phonetics, config):

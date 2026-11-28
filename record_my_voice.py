@@ -1,10 +1,10 @@
 """
 Script: record_my_voice.py
-Mục đích: Ghi âm 10 lần khẩu lệnh "Tèo đâu" của chủ nhân, trích xuất đặc trưng giọng nói bằng Resemblyzer và lưu vào file `my_voice.pkl`.
+Mục đích: Ghi âm 5 lần khẩu lệnh "Tèo đâu" tự nhiên của chủ nhân, trích xuất đặc trưng giọng nói bằng Resemblyzer và lưu vào file `my_voice.pkl`.
 Chức năng:
-    - Thu âm 10 lần có kiểm tra âm lượng (RMS) chống ghi âm khoảng lặng.
-    - Đa dạng hóa dữ liệu huấn luyện: đọc bình thường, hơi nhỏ, hơi nhanh, hơi chậm.
-    - Tính toán vector đặc trưng trung bình (Mean Embedding Vector).
+    - Thu âm 5 lần có kiểm tra âm lượng (RMS) chống ghi âm khoảng lặng.
+    - Đọc tự nhiên ở khoảng cách ngồi máy tính bình thường (3 lần bình thường, 1 lần hơi nhẹ giọng, 1 lần dứt khoát).
+    - Tính toán vector đặc trưng trung bình (Mean Embedding Vector) và lưu đồng thời danh sách vector từng mẫu.
     - Đo độ ổn định (Consistency Score) giữa các lần đọc.
     - Lưu vào `my_voice.pkl` để sử dụng cho tính năng Xác thực giọng nói (Voice Authentication).
 """
@@ -54,9 +54,9 @@ from voice_auth import VoiceAuthenticator, get_authenticator
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
-RECORD_DURATION = 2.2  # 2.2 giây là khoảng thời gian lý tưởng cho câu "Tèo đâu"
-NUM_SAMPLES = 10
-MIN_RMS_THRESHOLD = 300.0  # Ngưỡng âm lượng tối thiểu để tránh ghi âm gió hoặc im lặng
+RECORD_DURATION = 1.8  # 1.8 giây gọn gàng cho câu "Tèo đâu"
+NUM_SAMPLES = 5
+MIN_RMS_THRESHOLD = 150.0  # Ngưỡng âm lượng tối thiểu cho giọng nói tự nhiên trên mic laptop
 
 
 def play_start_tone():
@@ -99,8 +99,8 @@ def main():
     print(f"\n[Microphone]: Đang sử dụng '{mic_name}' (device_id={mic_idx})")
     print(f"Mỗi lần thu âm sẽ kéo dài {RECORD_DURATION:.1f} giây. Bạn chỉ cần nói tự nhiên: 'Tèo đâu'")
     print("\n💡 HƯỚNG DẪN QUAN TRỌNG:")
-    print("   Hãy đọc 10 lần với âm lượng và tốc độ đa dạng (bình thường, hơi nhỏ,")
-    print("   hơi nhanh, hơi chậm) để AI học giọng chính xác hơn.\n")
+    print("   Hãy ngồi ở đúng khoảng cách máy tính bình thường và đọc 5 lần tự nhiên")
+    print("   (3 lần giọng bình thường, 1 lần hơi nhẹ giọng, 1 lần dứt khoát).\n")
 
     is_auto_start = ("--record-voice" in sys.argv)
     if is_auto_start:
@@ -134,21 +134,19 @@ def main():
 
     take = 1
     while take <= NUM_SAMPLES:
-        # Gợi ý phong cách đọc cho từng nhóm lần đọc
+        # Gợi ý đọc 5 lần tự nhiên ở đúng khoảng cách ngồi máy tính bình thường
         if take <= 3:
-            style_tip = "âm lượng bình thường, tốc độ tự nhiên"
-        elif take <= 5:
-            style_tip = "âm lượng hơi nhỏ / nhẹ giọng một chút"
-        elif take <= 7:
-            style_tip = "tốc độ hơi nhanh / dứt khoát"
+            style_tip = "giọng bình thường, tự nhiên"
+        elif take == 4:
+            style_tip = "hơi nhẹ giọng một chút"
         else:
-            style_tip = "tốc độ hơi chậm, rõ ràng từng âm"
+            style_tip = "giọng dứt khoát"
 
         print(f"\n------------------------------------------------------------")
         print(f"🎙️  LẦN {take}/{NUM_SAMPLES} [{style_tip}]: Chuẩn bị nói 'Tèo đâu'...")
-        for count in range(3, 0, -1):
-            print(f"    Bắt đầu sau {count}s...", end="\r")
-            time.sleep(0.7)
+        for count in range(2, 0, -1):
+            print(f"    Bắt đầu sau {count}...", end="\r", flush=True)
+            time.sleep(0.6)
         print("    >> NÓI NGAY BÂY GIỜ: 'Tèo đâu' !               ")
         play_start_tone()
 
@@ -162,25 +160,25 @@ def main():
 
         if rms < MIN_RMS_THRESHOLD:
             print(f"    [!] Âm thanh quá nhỏ hoặc im lặng (RMS: {rms:.1f} < {MIN_RMS_THRESHOLD}). Vui lòng nói to rõ hơn!")
-            time.sleep(1.0)
+            time.sleep(0.8)
             continue
 
         # Trích xuất embedding
         emb = auth.compute_embedding(raw_audio_int16, sample_rate=SAMPLE_RATE)
         if emb is None:
             print("    [!] Không thể trích xuất đặc trưng giọng nói từ đoạn âm này. Thử lại...")
-            time.sleep(1.0)
+            time.sleep(0.8)
             continue
 
         embeddings.append(emb)
         recorded_waves.append(raw_audio_int16)
         print(f"    ✓ Đã ghi nhận mẫu giọng lần {take} thành công! (RMS: {rms:.1f})")
         take += 1
-        time.sleep(0.8)
+        time.sleep(0.4)
 
-    # 5. Tính vector trung bình của 10 mẫu và chuẩn hóa L2
+    # 5. Tính vector trung bình của 5 mẫu và chuẩn hóa L2
     print("\n" + "=" * 68)
-    print("  ĐANG TÍNH TOÁN HỒ SƠ SINH TRẮC HỌC GIỌNG NÓI (10 MẪU)...")
+    print(f"  ĐANG TÍNH TOÁN HỒ SƠ SINH TRẮC HỌC GIỌNG NÓI ({NUM_SAMPLES} MẪU)...")
     avg_embedding = np.mean(embeddings, axis=0)
     avg_embedding = avg_embedding / np.linalg.norm(avg_embedding)
 
@@ -192,8 +190,12 @@ def main():
     for idx, s in enumerate(scores, 1):
         print(f"    - Mẫu {idx:02d}: {s * 100:.1f}% khớp")
 
-    # Lưu vào my_voice.pkl
-    saved_path = auth.save_profile(avg_embedding, samples_count=NUM_SAMPLES)
+    # Lưu vào my_voice.pkl (cả vector trung bình lẫn danh sách từng mẫu)
+    saved_path = auth.save_profile(
+        avg_embedding,
+        samples_count=NUM_SAMPLES,
+        sample_embeddings=embeddings,
+    )
 
     print("\n🎉 HOÀN TẤT ĐĂNG KÝ HỒ SƠ GIỌNG NÓI CHỦ NHÂN!")
     print(f"📁 Hồ sơ đã được lưu tại: {saved_path}")

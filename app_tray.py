@@ -158,7 +158,9 @@ from utils import (
     get_configured_microphone,
     get_exe_dir,
     is_autostart_enabled,
+    load_config,
     resource_path,
+    save_config,
     set_autostart,
     set_configured_microphone,
 )
@@ -424,7 +426,8 @@ class CommandProcessingWorker(QThread):
                 self.show_overlay_sig.emit("Tèo đang lắng nghe...")
                 play_wake_sound()
 
-                if self._abort_event.is_set():
+                # Chờ 0.45s để loa phát xong tiếng "Dạ" (da.wav), chống mic thu ngược gây sai lệnh
+                if self._abort_event.wait(0.45):
                     return
 
                 # 2. Thu âm câu lệnh qua STT Engine (silence_limit=1.5s, max_duration=6.0s)
@@ -570,6 +573,22 @@ class CommandProcessingWorker(QThread):
             self.command_finished_sig.emit()
 
 
+class _TraySignalBridge(QObject):
+    """Cầu tín hiệu an toàn giữa các luồng phụ và Qt Main Thread cho System Tray."""
+
+    show_tray_message_sig = pyqtSignal(str, str, int)
+
+    def __init__(self, handler: Any, parent: Optional[QObject] = None) -> None:
+        super().__init__(parent)
+        self._handler = handler
+        self.show_tray_message_sig.connect(self._dispatch, Qt.ConnectionType.QueuedConnection)
+
+    @pyqtSlot(str, str, int)
+    def _dispatch(self, title: str, message: str, duration: int) -> None:
+        if self._handler is not None:
+            self._handler(title, message, duration)
+
+
 class TeoAssistantApp:
     """
     Lớp điều phối toàn diện ứng dụng Tèo Assistant (v1.3):
@@ -604,21 +623,27 @@ class TeoAssistantApp:
         self.brain = Brain()
         self.executor = ActionExecutor()
 
-        # 4. Khởi tạo Wake Word Engine bằng Vosk kết hợp Voice Auth (Resemblyzer) & Google STT xác thực chéo
-        print("[Tèo] [3/4] Đang khởi tạo Wake Word Engine ('Tèo đâu') với Voice Auth sinh trắc học...")
+        # 4. Khởi tạo Wake Word Engine (Silero VAD + Resemblyzer Voice Auth + Google STT + Vosk Lazy Fallback)
+        print("[Tèo] [3/4] Đang khởi tạo Wake Word Engine ('Tèo đâu') với Silero VAD & Google STT...")
+        voice_auth_enabled = bool(load_config().get("voice_auth_enabled", True))
         self.wake_engine = WakeWordEngine(
             wake_keyword="tèo đâu",
             on_detected=self._on_wake_word_triggered,
             min_conf=0.65,
             fuzzy_threshold=70.0,
-            voice_auth_threshold=0.80,
-            min_rms=350.0,
-            dual_auth_min_rms=500.0,
-            silence_limit_sec=0.8,
+            voice_auth_threshold=0.65,
+            min_rms=180.0,
+            dual_auth_min_rms=300.0,
+            vad_mode=1,
+            silence_limit_sec=0.65,
             cooldown_sec=1.0,
+            voice_auth_enabled=voice_auth_enabled,
             stt_verifier=self.stt.recognize_google,
         )
         self.stt.set_wake_engine(self.wake_engine)
+
+        # Cầu tín hiệu đẩy thông báo Tray về Qt Main Thread an toàn
+        self._tray_bridge = _TraySignalBridge(self._show_tray_message, parent=self.app)
 
         # 5. Khởi tạo Worker xử lý giọng nói (QThread)
         print("[Tèo] [4/4] Đang kết nối luồng xử lý giọng nói CommandProcessingWorker...")
@@ -716,6 +741,13 @@ class TeoAssistantApp:
         self.toggle_wake_action.setChecked(True)
         self.toggle_wake_action.triggered.connect(self._toggle_wake_word)
         self.tray_menu.addAction(self.toggle_wake_action)
+
+        # 2b. Bật/Tắt Xác thực giọng chủ (Voice ID)
+        self.toggle_voice_auth_action = QAction("🛡️ Xác thực giọng chủ (Voice ID)", self.tray_menu)
+        self.toggle_voice_auth_action.setCheckable(True)
+        self.toggle_voice_auth_action.setChecked(bool(self.wake_engine.voice_auth_enabled))
+        self.toggle_voice_auth_action.triggered.connect(self._toggle_voice_auth)
+        self.tray_menu.addAction(self.toggle_voice_auth_action)
 
         # 3. Kiểm tra thử nghiệm Overlay
         test_overlay_action = QAction("Xem thử Overlay (3s)", self.tray_menu)
@@ -831,8 +863,29 @@ class TeoAssistantApp:
             2500,
         )
 
+    def _show_tray_message(self, title: str, message: str, duration_ms: int = 3500) -> None:
+        """Hiển thị thông báo System Tray an toàn trên luồng chính (Main Thread)."""
+        if hasattr(self, "tray_icon") and self.tray_icon is not None:
+            self.tray_icon.showMessage(
+                title,
+                message,
+                QSystemTrayIcon.MessageIcon.Information,
+                duration_ms,
+            )
+
+    def _toggle_voice_auth(self, checked: bool) -> None:
+        """Bật hoặc tắt xác thực sinh trắc học giọng chủ nhân (Voice ID) tức thì và lưu config.json."""
+        self.wake_engine.voice_auth_enabled = bool(checked)
+        cfg = load_config()
+        cfg["voice_auth_enabled"] = bool(checked)
+        save_config(cfg)
+        state = "BẬT" if checked else "TẮT"
+        msg = f"Đã {state} xác thực giọng chủ (Voice ID)."
+        print(f"[App] 🛡️ {msg}", flush=True)
+        self._show_tray_message("Xác thực giọng chủ (Voice ID)", msg, 2500)
+
     def _enroll_voice_id(self) -> None:
-        """Kích hoạt chương trình ghi âm 10 lần khẩu lệnh 'Tèo đâu' để đăng ký Voice ID."""
+        """Kích hoạt chương trình ghi âm 5 lần khẩu lệnh 'Tèo đâu' để đăng ký Voice ID."""
         # Tạm dừng Wake Word để nhường micro cho việc ghi âm
         self.wake_engine.pause()
 
@@ -847,8 +900,8 @@ class TeoAssistantApp:
             "<p><b>Quy trình thu âm:</b></p>"
             "<ol>"
             "<li>Một cửa sổ dòng lệnh (Console) sẽ hiện lên.</li>"
-            "<li>Hệ thống sẽ đếm ngược <b>3, 2, 1</b> và phát tiếng bíp.</li>"
-            "<li>Bạn nói rõ ràng: <b>\"Tèo đâu\"</b> (lặp lại <b>10 lần</b>).</li>"
+            "<li>Hệ thống sẽ đếm ngược nhanh <b>2, 1</b> và phát tiếng bíp.</li>"
+            "<li>Bạn nói tự nhiên: <b>\"Tèo đâu\"</b> ở khoảng cách ngồi máy bình thường (lặp lại <b>5 lần</b>).</li>"
             "</ol>"
             "<p>Nhấn <b>OK</b> để bắt đầu ghi âm ngay bây giờ!</p>"
         )
@@ -889,10 +942,9 @@ class TeoAssistantApp:
                 except Exception as exc:
                     print(f"[App Lỗi] Không thể reload Voice profile: {exc}")
                 self.wake_engine.resume()
-                self.tray_icon.showMessage(
+                self._tray_bridge.show_tray_message_sig.emit(
                     "Đăng ký Giọng nói thành công",
                     "Đã lưu thành công hồ sơ Voice ID! Giờ đây chỉ có bạn mới có thể đánh thức Tèo.",
-                    QSystemTrayIcon.MessageIcon.Information,
                     3500,
                 )
 

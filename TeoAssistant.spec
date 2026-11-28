@@ -26,20 +26,21 @@ datas += collect_data_files('vosk')
 # Resemblyzer voice authentication model (pretrained.pt)
 datas += collect_data_files('resemblyzer')
 
+# Silero VAD assets (backend PyTorch onnx=False)
+datas += collect_data_files('silero_vad')
+
 # Gom các file dữ liệu cục bộ vào thư mục phân phối
 # - da.wav: Âm thanh phản hồi Wake Word ("Dạ")
 # - memory.json: Bộ nhớ đệm Fast Path
 # - learned_phonetics.json: Từ lóng / phiên âm
 # - offline_learning.json: Từ điển tự học Vosk
-# - my_voice.pkl: Hồ sơ sinh trắc học giọng nói chủ nhân
 # - model: Thư mục mô hình Vosk Offline tiếng Việt
+# (Không đóng gói config.json & my_voice.pkl để bản .exe trên máy khác không bị dính micro/giọng chủ cũ)
 local_assets = [
     ('da.wav', '.'),
     ('memory.json', '.'),
     ('learned_phonetics.json', '.'),
     ('offline_learning.json', '.'),
-    ('config.json', '.'),
-    ('my_voice.pkl', '.'),
     ('vosk-model-vn-0.22', 'vosk-model-vn-0.22'),
     ('model', 'model'),
 ]
@@ -110,16 +111,18 @@ hiddenimports = [
     'auto_learn',
     'voice_auth',
     'record_my_voice',
+    'silero_vad',
     'noisereduce',
     'resemblyzer',
     'librosa',
     'torch',
 ]
 
-# Tự động gom thêm submodules của vosk, PyQt6, resemblyzer và noisereduce
+# Tự động gom thêm submodules của vosk, PyQt6, resemblyzer và silero_vad
 hiddenimports += collect_submodules('vosk')
 hiddenimports += collect_submodules('PyQt6')
 hiddenimports += collect_submodules('resemblyzer')
+hiddenimports += collect_submodules('silero_vad')
 hiddenimports += collect_submodules('noisereduce')
 
 # Loại bỏ trùng lặp
@@ -129,12 +132,12 @@ hiddenimports = list(dict.fromkeys(hiddenimports))
 excludes = [
     'openwakeword',
     'onnxruntime',
+    'faster_whisper',
+    'ctranslate2',
     'torchaudio',
     'torchinfo',
     'matplotlib',
     'tkinter',
-    'faster_whisper',
-    'ctranslate2',
     'openpyxl',
     'fastapi',
     'uvicorn',

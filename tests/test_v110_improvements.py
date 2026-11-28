@@ -19,41 +19,50 @@ from wake_word_engine import WakeWordEngine
 
 
 def test_wake_word_thresholds():
-    """Kiểm tra các tham số mặc định của WakeWordEngine."""
+    """Kiểm tra các tham số mặc định của WakeWordEngine (Silero VAD + Duration Gate 2.1s + Google STT + Vosk Lazy)."""
+    assert not (ROOT_DIR / "whisper_engine.py").exists(), "whisper_engine.py phải đã được gỡ bỏ hoàn toàn!"
+
     engine = WakeWordEngine(vosk_model_path="tests")
-    assert engine.min_conf == 0.60, f"Expected min_conf 0.60, got {engine.min_conf}"
+    assert engine.min_conf == 0.65, f"Expected min_conf 0.65, got {engine.min_conf}"
     assert engine.fuzzy_threshold == 70.0, f"Expected fuzzy_threshold 70.0, got {engine.fuzzy_threshold}"
-    assert engine.min_rms == 350.0, f"Expected min_rms 350.0, got {engine.min_rms}"
+    assert engine.min_rms == 180.0, f"Expected min_rms 180.0, got {engine.min_rms}"
+    assert engine.dual_auth_min_rms == 300.0, f"Expected dual_auth_min_rms 300.0, got {engine.dual_auth_min_rms}"
+    assert engine.RECORD_DURATION_SEC == 2.1, f"Expected RECORD_DURATION_SEC 2.1, got {engine.RECORD_DURATION_SEC}"
+    assert engine.SILERO_START_PROB == 0.55, f"Expected SILERO_START_PROB 0.55, got {engine.SILERO_START_PROB}"
+    assert engine.vad_mode == 1, f"Expected vad_mode 1, got {engine.vad_mode}"
+    assert engine.silence_limit_sec == 0.65, f"Expected silence_limit_sec 0.65, got {engine.silence_limit_sec}"
     assert engine.cooldown_sec == 1.0, f"Expected cooldown_sec 1.0, got {engine.cooldown_sec}"
-    assert engine.voice_auth_threshold == 0.80, f"Expected voice_auth_threshold 0.80, got {engine.voice_auth_threshold}"
-    assert engine.min_cosine == 0.80, f"Expected min_cosine 0.80, got {engine.min_cosine}"
+    assert engine.voice_auth_threshold == 0.65, f"Expected voice_auth_threshold 0.65, got {engine.voice_auth_threshold}"
+    assert engine.min_cosine == 0.65, f"Expected min_cosine 0.65, got {engine.min_cosine}"
+    assert engine.model is None, "Không được nạp Vosk Model lúc khởi động (phải Lazy-Load)!"
+    assert engine._use_silero is True and engine.block_size == 512, "Phải ưu tiên Silero VAD (512 samples)"
 
 
 def test_wake_word_condition_filtering():
-    """Kiểm tra logic lọc điều kiện conf >= 0.60 và Fuzzy matching >= 75% cho từ khóa 'tèo đâu'."""
+    """Kiểm tra logic lọc điều kiện conf >= 0.65 và Fuzzy matching >= 70% cho từ khóa 'tèo đâu'."""
     engine = WakeWordEngine(vosk_model_path="tests")
 
-    # 1. Khớp từ khóa chuẩn nhưng conf thấp (< 0.60) -> Phải TỪ CHỐI
+    # 1. Khớp từ khóa chuẩn nhưng conf thấp (< 0.65) -> Phải TỪ CHỐI
     matched, _ = engine._check_wake_condition("tèo đâu", conf=0.55)
-    assert matched is False, "Conf 0.55 phải bị từ chối vì ngưỡng tối thiểu là 0.60"
+    assert matched is False, "Conf 0.55 phải bị từ chối vì ngưỡng tối thiểu là 0.65"
 
-    # 2. Khớp từ khóa chuẩn với conf cao (>= 0.60) -> Phải CHẤP NHẬN
+    # 2. Khớp từ khóa chuẩn với conf cao (>= 0.65) -> Phải CHẤP NHẬN
     matched, phrase = engine._check_wake_condition("tèo đâu", conf=0.65)
     assert matched is True, "Conf 0.65 với từ khóa 'tèo đâu' phải được chấp nhận"
     assert "teo" in phrase or "tèo" in phrase
 
-    # 3. Fuzzy Matching: 'theo đó' (conf 0.64 >= 0.60, fuzzy >= 75%) -> Phải CHẤP NHẬN ứng viên
-    matched_fuzzy, phrase_fuzzy = engine._check_wake_condition("theo đó", conf=0.64)
-    assert matched_fuzzy is True, "'theo đó' (conf 0.64) phải được chấp nhận qua RapidFuzz >= 75%"
+    # 3. Fuzzy Matching: 'theo đó' (conf 0.66 >= 0.65, fuzzy >= 70%) -> Phải CHẤP NHẬN ứng viên
+    matched_fuzzy, phrase_fuzzy = engine._check_wake_condition("theo đó", conf=0.66)
+    assert matched_fuzzy is True, "'theo đó' (conf 0.66) phải được chấp nhận qua RapidFuzz >= 70%"
     assert "Fuzzy" in phrase_fuzzy or "theo" in phrase_fuzzy
 
     # 4. Tạp âm hoặc câu dài (> 3 từ) -> Phải TỪ CHỐI (Cấm tuyệt đối fuzzy match cho câu dài)
     matched, _ = engine._check_wake_condition("đi tìm cái gì đó", conf=0.99)
     assert matched is False, "Câu dài > 3 từ phải bị từ chối ngay cả khi conf cao"
 
-    # 5. Từ ngắn khác hẳn (< 75% fuzzy) -> Phải TỪ CHỐI
+    # 5. Từ ngắn khác hẳn (< 70% fuzzy) -> Phải TỪ CHỐI
     matched_diff, _ = engine._check_wake_condition("đi chơi đi", conf=0.90)
-    assert matched_diff is False, "'đi chơi đi' không đủ 75% tương đồng với 'teo dau'"
+    assert matched_diff is False, "'đi chơi đi' không đủ 70% tương đồng với 'teo dau'"
 
 
 def test_brain_fast_path_split_and():
@@ -105,7 +114,7 @@ def test_brain_fast_path_split_and():
 
 
 def test_brain_ollama_timeout_fallback(monkeypatch):
-    """Kiểm tra xử lý Timeout HTTP khi gọi Ollama trong brain.py."""
+    """Kiểm tra xử lý Ollama tắt (socket check < 0.5s) & Timeout HTTP trong brain.py."""
     import requests
 
     def mock_post_timeout(*args, **kwargs):
@@ -113,39 +122,69 @@ def test_brain_ollama_timeout_fallback(monkeypatch):
 
     monkeypatch.setattr(requests, "post", mock_post_timeout)
 
+    # Kiểm tra khi Ollama tắt (port không chạy) phải thoát cực nhanh (< 0.5s)
+    brain_closed = Brain(ollama_url="http://localhost:19999")
+    t0 = time.time()
+    res_closed = brain_closed._slow_path("một câu lệnh rất lạ không có trong danh sách chuẩn")
+    elapsed_closed = time.time() - t0
+    assert res_closed == [{"action": "unknown"}], f"Kỳ vọng fallback về unknown, nhận được: {res_closed}"
+    assert elapsed_closed < 0.5, f"Slow Path khi Ollama tắt phải thoát < 0.5s, thực tế: {elapsed_closed:.3f}s"
+
     brain = Brain(ollama_url="http://localhost:11434")
-    # Lệnh không thuộc Fast Path buộc phải vào Slow Path
+    t1 = time.time()
     res = brain._slow_path("một câu lệnh rất lạ không có trong danh sách chuẩn")
+    elapsed = time.time() - t1
     assert res == [{"action": "unknown"}], f"Kỳ vọng fallback về unknown, nhận được: {res}"
+    assert elapsed < 0.5, f"Slow Path phải thoát < 0.5s khi Ollama chưa bật, thực tế: {elapsed:.3f}s"
 
 
 def test_google_stt_cross_verification():
-    """Kiểm tra logic Lớp 2: Xác thực chéo bằng Google STT."""
+    """Kiểm tra logic Lớp 2/Lớp 3: Xác thực chéo bằng Voice Auth & Google STT."""
     # 1. Kiểm tra bộ lọc chuỗi _is_google_stt_matched
     assert WakeWordEngine._is_google_stt_matched("Tèo đâu") is True
     assert WakeWordEngine._is_google_stt_matched("tèo đâu") is True
     assert WakeWordEngine._is_google_stt_matched("teo dau") is True
-    # Hỗ trợ nới lỏng RapidFuzz >= 80% ("em đâu", "tiền đâu", "theo đâu")
-    assert WakeWordEngine._is_google_stt_matched("em đâu") is True
     assert WakeWordEngine._is_google_stt_matched("tiền đâu") is True
     assert WakeWordEngine._is_google_stt_matched("theo đâu") is True
+    assert WakeWordEngine._is_google_stt_matched("tèo đó") is True
+    assert WakeWordEngine._is_google_stt_matched("tèo đâu mở chrome") is True
+    assert WakeWordEngine._is_google_stt_matched("ê này tèo đâu") is True
+    # Khẩu lệnh tự nhiên mới: "Tèo ơi", "Alo Tèo" / "A lô Tèo"
+    assert WakeWordEngine._is_google_stt_matched("Tèo ơi") is True
+    assert WakeWordEngine._is_google_stt_matched("tèo ơi mở chrome") is True
+    assert WakeWordEngine._is_google_stt_matched("Alo Tèo") is True
+    assert WakeWordEngine._is_google_stt_matched("a lô tèo") is True
 
-    # 2. Blacklist và các từ không khớp -> PHẢI BÁC BỎ 100%
+    # 2. Blacklist và các từ không khớp (khi owner_cosine=0.0) -> PHẢI BÁC BỎ 100%
     assert WakeWordEngine._is_google_stt_matched("ơi tèo đâu rồi") is False  # Nằm trong Blacklist
     assert WakeWordEngine._is_google_stt_matched("mèo đâu") is False        # Nằm trong Blacklist
+    assert WakeWordEngine._is_google_stt_matched("kèo đâu") is False        # Nằm trong Blacklist
     assert WakeWordEngine._is_google_stt_matched("heo đất") is False        # Nằm trong Blacklist
+    assert WakeWordEngine._is_google_stt_matched("Heo Đất") is False        # Nằm trong Blacklist
+    assert WakeWordEngine._is_google_stt_matched("ta ở đâu") is False       # Nằm trong Blacklist
     assert WakeWordEngine._is_google_stt_matched("kêu đâu") is False
     assert WakeWordEngine._is_google_stt_matched("mày đi đâu đấy") is False  # Nằm trong Blacklist
     assert WakeWordEngine._is_google_stt_matched("chào bạn hôm nay thế nào") is False
     assert WakeWordEngine._is_google_stt_matched("mở chrome lên đi") is False
     assert WakeWordEngine._is_google_stt_matched("") is False
 
-    # 3. Kiểm tra Voice Auth (Lớp 1.5) & Google STT (Lớp 2)
+    # 2b. Owner-Verified Phonetic Rescue (CHỈ kích hoạt khi owner_cosine >= 0.75)
+    assert WakeWordEngine._is_google_stt_matched("Heo Đất", owner_cosine=0.82) is True
+    assert WakeWordEngine._is_google_stt_matched("ta ở đâu", owner_cosine=0.82) is True
+    assert WakeWordEngine._is_google_stt_matched("mèo đâu", owner_cosine=0.82) is True
+    assert WakeWordEngine._is_google_stt_matched("Tèo ơi", owner_cosine=0.82) is True
+    # Khi owner_cosine < 0.75 -> vẫn chặn tuyệt đối theo blacklist
+    assert WakeWordEngine._is_google_stt_matched("Heo Đất", owner_cosine=0.70) is False
+    assert WakeWordEngine._is_google_stt_matched("ta ở đâu", owner_cosine=0.60) is False
+    assert WakeWordEngine._is_google_stt_matched("mày đi đâu đấy", owner_cosine=0.90) is False
+
+    # 3. Kiểm tra Voice Auth (Lớp 2) & Google STT (Lớp 3)
     triggered = []
     engine = WakeWordEngine(
         vosk_model_path="tests",
         on_detected=lambda kw, score: triggered.append(kw),
-        voice_verifier=lambda audio: (False, 0.40),  # Giả lập: Người lạ hoặc tiếng ồn (cosine 0.40 < 0.75)
+        voice_auth_enabled=True,
+        voice_verifier=lambda audio: (False, 0.40),  # Giả lập: Người lạ hoặc tiếng ồn (cosine 0.40 < 0.65)
         stt_verifier=lambda audio: "Tèo đâu",
     )
     mock_audio = b"\x00" * 32000
@@ -155,11 +194,11 @@ def test_google_stt_cross_verification():
     assert res_stranger is False, "Khi Voice Auth từ chối, phải dừng ngay và không kích hoạt!"
     assert len(triggered) == 0, "Không được gọi on_detected khi Voice Auth từ chối"
 
-    # 3.2. Đúng giọng chủ nhân (cosine 0.85 >= 0.75) nhưng Google STT nghe ra 'kêu đâu' (< 80%)
+    # 3.2. Đúng giọng chủ nhân (cosine 0.85 >= 0.65) nhưng Google STT nghe ra 'kêu đâu'
     engine.voice_verifier = lambda audio: (True, 0.85)
     engine.stt_verifier = lambda audio: "kêu đâu"
     res_wrong_word = engine._handle_cross_verification(mock_audio, "tèo đâu", vosk_conf=0.90)
-    assert res_wrong_word is False, "Khi Google STT trả về 'kêu đâu' (< 80%), phải bác bỏ"
+    assert res_wrong_word is False, "Khi Google STT trả về 'kêu đâu', phải bác bỏ"
     assert len(triggered) == 0
 
     # 3.3. Đúng giọng chủ nhân + Google STT xác nhận 'Tèo đâu' -> KÍCH HOẠT!
@@ -168,13 +207,14 @@ def test_google_stt_cross_verification():
     assert res_success is True, "Xác thực đúng giọng + Google STT xác nhận -> Phải kích hoạt!"
     assert len(triggered) == 1
 
-    # 3.4. Đúng giọng chủ nhân + Google STT mất mạng/timeout (trả về '') -> Vẫn kích hoạt an toàn!
+    # 3.4. Đúng giọng chủ nhân + Google STT trả về rỗng '' (không lỗi mạng) -> Bỏ qua, KHÔNG nạp Vosk!
     engine.stt_verifier = lambda audio: ""
-    res_offline = engine._handle_cross_verification(mock_audio, "tèo đâu", vosk_conf=0.90)
-    assert res_offline is True, "Đã xác thực giọng chủ nhân thành công, khi mất mạng vẫn kích hoạt an toàn!"
-    assert len(triggered) == 2
+    res_empty = engine._handle_cross_verification(mock_audio, "tèo đâu", vosk_conf=0.90)
+    assert res_empty is False, "Google STT trả rỗng '' (không lỗi mạng) phải bỏ qua, không kích hoạt!"
+    assert engine.model is None, "Không được nạp Vosk khi Google STT chỉ trả rỗng (không lỗi mạng)!"
+    assert len(triggered) == 1
 
-    # 3.5. Cơ chế Xác thực kép: Voice Auth từ chối (cosine 0.55 < 0.70 do ồn) nhưng Google STT xác nhận "Tèo đâu" và RMS > 500
+    # 3.5. Cơ chế Xác thực kép: Voice Auth từ chối (cosine 0.55 >= 0.65 - 0.10) nhưng Google STT xác nhận "Tèo đâu" và RMS > 300
     import numpy as np
     t = np.linspace(0, 1.0, 16000, dtype=np.float32)
     loud_audio_samples = (1500.0 * np.sin(2 * np.pi * 300 * t)).astype(np.int16)
@@ -182,8 +222,57 @@ def test_google_stt_cross_verification():
     engine.voice_verifier = lambda audio: (False, 0.55)
     engine.stt_verifier = lambda audio: "Tèo đâu"
     res_dual = engine._handle_cross_verification(loud_audio_bytes, "tèo đâu", vosk_conf=0.90)
-    assert res_dual is True, "Cơ chế Xác thực kép: Google STT xác nhận 'Tèo đâu' + RMS > 500 phải kích hoạt dù Voice Auth < 0.70!"
+    assert res_dual is True, "Cơ chế Xác thực kép: Google STT xác nhận 'Tèo đâu' + RMS > 300 + cosine >= 0.55 phải kích hoạt!"
+    assert len(triggered) == 2
+
+    # 3.6. Người lạ hét to (cosine 0.40 < 0.55, RMS > 300) -> PHẢI TỪ CHỐI DualAuth
+    engine.voice_verifier = lambda audio: (False, 0.40)
+    res_stranger_loud = engine._handle_cross_verification(loud_audio_bytes, "tèo đâu", vosk_conf=0.90)
+    assert res_stranger_loud is False, "Người lạ hét to (cosine < threshold - 0.10) phải bị từ chối!"
+    assert len(triggered) == 2
+
+    # 3.7. Tắt Voice Auth (voice_auth_enabled=False) -> Bỏ qua Lớp 2 đi thẳng sang Lớp 3
+    engine.voice_auth_enabled = False
+    res_no_va = engine._handle_cross_verification(mock_audio, "tèo đâu", vosk_conf=0.90)
+    assert res_no_va is True, "Khi tắt voice_auth_enabled, phải bỏ qua Lớp 2 và chấp nhận qua Google STT!"
     assert len(triggered) == 3
+
+    # 3.8. Kiểm tra Duration Gate 2.1s chặn tiếng hát / nói chuyện dài ngay tại Lớp 1
+    va_calls = []
+    stt_calls = []
+    gate_engine = WakeWordEngine(
+        vosk_model_path="tests",
+        cooldown_sec=0.0,
+        voice_auth_enabled=True,
+        voice_verifier=lambda audio: (va_calls.append(1) or True, 0.90),
+        stt_verifier=lambda audio: (stt_calls.append(1) or "Tèo đâu"),
+    )
+    loud_block = (2000.0 * np.sin(2 * np.pi * 300 * np.linspace(0, 0.032, 512, dtype=np.float32))).astype(np.int16).tobytes()
+
+    class _FakeLongSingingStream:
+        active = True
+        stopped = False
+        def __init__(self, eng_ref):
+            self.eng_ref = eng_ref
+            self.reads = 0
+        def read(self, n):
+            self.reads += 1
+            if self.reads > 75:  # > 2.4s liên tục -> dừng vòng lặp sau khi Duration Gate đã chạy
+                self.eng_ref._running = False
+                self.eng_ref.is_listening = False
+            return loud_block, False
+        def stop(self):
+            pass
+        def close(self):
+            pass
+
+    gate_engine._get_silero_prob = lambda pcm: 0.90  # Giả lập tiếng hát/nói liên tục không ngắt
+    gate_engine._running = True
+    gate_engine.is_listening = True
+    gate_engine.stream = _FakeLongSingingStream(gate_engine)
+    gate_engine._listen_loop()
+    assert len(va_calls) == 0, "Duration Gate 2.1s phải chặn tại Lớp 1, KHÔNG gọi Voice Auth!"
+    assert len(stt_calls) == 0, "Duration Gate 2.1s phải chặn tại Lớp 1, KHÔNG gọi Google STT!"
 
 
 def test_memory_cache_verb_compatibility():
@@ -259,9 +348,29 @@ def test_memory_cache_number_bypass():
 
 
 def test_stt_timeout_fallback():
-    """Kiểm tra giới hạn thời gian nhận diện Google STT (3s) và chuyển sang Offline."""
+    """Kiểm tra STT không nạp Vosk khi khởi động/Online và timeout Google STT."""
     from stt_engine import SpeechToText
     stt = SpeechToText()
+    assert stt.vosk_model is None, "SpeechToText KHÔNG được nạp Vosk lúc khởi động!"
+
+    # Kiểm tra khi Online + Google trả về kết quả -> KHÔNG nạp Vosk
+    orig_online = stt.is_online
+    orig_google = stt.recognize_google
+    try:
+        stt.is_online = lambda: True
+        stt.recognize_google = lambda audio, timeout=2.5: "mở chrome"
+        out = stt.process_audio(b"\x01\x00" * 4000)
+        assert out == "mở chrome"
+        assert stt.vosk_model is None, "Không được nạp Vosk khi Online thành công!"
+
+        # Google trả rỗng '' -> trả '' và KHÔNG nạp Vosk
+        stt.recognize_google = lambda audio, timeout=2.5: ""
+        out_empty = stt.process_audio(b"\x01\x00" * 4000)
+        assert out_empty == ""
+        assert stt.vosk_model is None, "Không được nạp Vosk khi Google trả rỗng ''!"
+    finally:
+        stt.is_online = orig_online
+        stt.recognize_google = orig_google
 
     # Giả lập Google STT bị delay > 3s (mất mạng/lag)
     def mock_hang_recognize_google(*args, **kwargs):
@@ -270,7 +379,7 @@ def test_stt_timeout_fallback():
 
     stt.recognizer.recognize_google = mock_hang_recognize_google
     try:
-        # Gọi recognize_google với timeout=3.0s phải ném TimeoutError
+        # Gọi recognize_google với timeout=1.0s phải ném TimeoutError
         stt.recognize_google(b"\x00" * 3200, timeout=1.0)
         assert False, "Kỳ vọng TimeoutError sau khi quá thời gian timeout!"
     except TimeoutError as te:
@@ -343,15 +452,29 @@ def test_voice_auth_offline():
     # Gán emb_a làm reference_embedding của chủ nhân
     auth.reference_embedding = emb_a
 
-    # So sánh chính mẫu của chủ nhân (self-similarity) -> Phải >= 0.75
-    matched, sim = auth.verify_voice(sample_a, sample_rate=16000, threshold=0.75)
+    # So sánh chính mẫu của chủ nhân (self-similarity) -> Phải >= 0.65
+    matched, sim = auth.verify_voice(sample_a, sample_rate=16000, threshold=0.65)
     assert matched is True
     assert sim >= 0.95, f"Self-similarity phải gần 1.0, nhận được: {sim}"
 
-    # So sánh với mẫu âm thanh của người lạ (sample_b) -> Phải < 0.75 (khoảng ~0.41)
-    matched_diff, sim_diff = auth.verify_voice(sample_b, sample_rate=16000, threshold=0.75)
-    assert matched_diff is False, f"Giọng người lạ không được vượt qua ngưỡng 0.75 (nhận {sim_diff})"
-    assert sim_diff < 0.75, f"Similarity của giọng lạ phải < 0.75, nhận được: {sim_diff}"
+    # So sánh với mẫu âm thanh của người lạ (sample_b) -> Phải < 0.65
+    matched_diff, sim_diff = auth.verify_voice(sample_b, sample_rate=16000, threshold=0.65)
+    assert matched_diff is False, f"Giọng người lạ không được vượt qua ngưỡng 0.65 (nhận {sim_diff})"
+    assert sim_diff < 0.65, f"Similarity của giọng lạ phải < 0.65, nhận được: {sim_diff}"
+
+    # 3. Kiểm tra lưu & tải đa mẫu (sample_embeddings)
+    tmp_profile = Path("tests/tmp_multi_sample_voice.pkl")
+    try:
+        auth_multi = VoiceAuthenticator(profile_path=str(tmp_profile))
+        auth_multi.save_profile(emb_a, samples_count=5, sample_embeddings=[emb_a, emb_a])
+        auth_reload = VoiceAuthenticator(profile_path=str(tmp_profile))
+        assert auth_reload.is_enrolled() is True
+        assert len(auth_reload.sample_embeddings) == 2
+        m_ok, s_ok = auth_reload.verify_voice(sample_a, sample_rate=16000)
+        assert m_ok is True and s_ok >= 0.95
+    finally:
+        if tmp_profile.exists():
+            tmp_profile.unlink()
 
 
 if __name__ == "__main__":

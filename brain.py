@@ -1270,6 +1270,21 @@ Output: {"actions": [{"action": "screenshot"}, {"action": "shutdown"}]}
 
         chat_url = f"{self.ollama_url}/api/chat"
 
+        # Kiểm tra nhanh cổng Ollama bằng socket (timeout 0.15s) để tránh treo 5-7s khi Ollama chưa bật
+        try:
+            import socket
+            from urllib.parse import urlparse
+
+            parsed = urlparse(self.ollama_url if "://" in self.ollama_url else f"http://{self.ollama_url}")
+            host = parsed.hostname or "localhost"
+            port = parsed.port or (443 if parsed.scheme == "https" else 11434)
+            connect_host = "127.0.0.1" if host == "localhost" else host
+            with socket.create_connection((connect_host, port), timeout=0.15):
+                pass
+        except OSError:
+            print(f"[Brain] Ollama không chạy tại {host}:{port} -> Bỏ qua Slow Path (<0.2s).")
+            return [{"action": "unknown"}]
+
         payload = {
             "model": self.model,
             "messages": [

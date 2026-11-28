@@ -12,7 +12,7 @@ from pathlib import Path
 import pickle
 import sys
 import time
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -38,11 +38,12 @@ except ImportError:
     preprocess_wav = None
 
 try:
-    import noisereduce as nr
-    HAS_NOISEREDUCE = True
+    from scipy.signal import butter, sosfiltfilt
+    HAS_SCIPY_SIGNAL = True
 except ImportError:
-    HAS_NOISEREDUCE = False
-    nr = None
+    HAS_SCIPY_SIGNAL = False
+    butter = None
+    sosfiltfilt = None
 
 
 class VoiceAuthenticator:
@@ -51,23 +52,21 @@ class VoiceAuthenticator:
     Khởi tạo mô hình một lần duy nhất vào bộ nhớ để tái sử dụng tức thì (<10ms).
     """
 
-    DEFAULT_THRESHOLD: float = 0.80
-    min_cosine: float = 0.80
+    DEFAULT_THRESHOLD: float = 0.65
+    min_cosine: float = 0.65
     PROFILE_FILENAME: str = "my_voice.pkl"
 
     def __init__(self, profile_path: Optional[str] = None):
         self.profile_path = profile_path or self._resolve_profile_path()
         self.encoder: Optional[VoiceEncoder] = None
         self.reference_embedding: Optional[np.ndarray] = None
+        self.sample_embeddings: List[np.ndarray] = []
         self.min_cosine: float = self.DEFAULT_THRESHOLD
         self._load_encoder()
         self.load_profile()
 
     def _resolve_profile_path(self) -> str:
-        """Tìm đường dẫn tệp my_voice.pkl trong thư mục ứng dụng hoặc get_data_path."""
-        local_file = Path(self.PROFILE_FILENAME)
-        if local_file.exists():
-            return str(local_file.resolve())
+        """Luôn sử dụng đường dẫn chuẩn duy nhất từ get_data_path cho tệp my_voice.pkl."""
         return get_data_path(self.PROFILE_FILENAME, default_content="")
 
     def _load_encoder(self) -> None:
@@ -85,18 +84,22 @@ class VoiceAuthenticator:
             self.encoder = None
 
     def load_profile(self) -> bool:
-        """Tải vector đặc trưng giọng chủ nhân từ tệp my_voice.pkl."""
+        """Tải vector đặc trưng giọng chủ nhân (và các vector mẫu riêng lẻ nếu có) từ tệp my_voice.pkl."""
         path = Path(self.profile_path)
+        self.reference_embedding = None
+        self.sample_embeddings = []
+
         if not path.exists() or path.stat().st_size == 0:
-            self.reference_embedding = None
             return False
 
         try:
             with open(path, "rb") as f:
                 data = pickle.load(f)
 
+            raw_samples = []
             if isinstance(data, dict) and "embedding" in data:
                 emb = np.array(data["embedding"], dtype=np.float32)
+                raw_samples = data.get("sample_embeddings") or []
             elif isinstance(data, np.ndarray):
                 emb = data.astype(np.float32)
             else:
@@ -106,14 +109,27 @@ class VoiceAuthenticator:
             norm = np.linalg.norm(emb)
             if norm > 0:
                 self.reference_embedding = emb / norm
-                print(f"[VoiceAuth] ✓ Đã tải hồ sơ giọng chủ nhân từ '{path.name}' (vector {self.reference_embedding.shape}).")
+                normalized_samples: List[np.ndarray] = []
+                for s in raw_samples:
+                    s_arr = np.array(s, dtype=np.float32)
+                    s_norm = np.linalg.norm(s_arr)
+                    if s_norm > 0:
+                        normalized_samples.append(s_arr / s_norm)
+                self.sample_embeddings = normalized_samples
+                sample_info = f", {len(self.sample_embeddings)} mẫu riêng" if self.sample_embeddings else ""
+                print(
+                    f"[VoiceAuth] ✓ Đã tải hồ sơ giọng chủ nhân từ '{path.name}' "
+                    f"(vector {self.reference_embedding.shape}{sample_info})."
+                )
                 return True
             else:
                 self.reference_embedding = None
+                self.sample_embeddings = []
                 return False
         except Exception as exc:
             print(f"[VoiceAuth Lỗi] Không thể đọc tệp hồ sơ giọng nói '{path}': {exc}")
             self.reference_embedding = None
+            self.sample_embeddings = []
             return False
 
     def is_enrolled(self) -> bool:
@@ -149,12 +165,16 @@ class VoiceAuthenticator:
             if len(wav) == 0:
                 return None
 
-            # 1.5. Lọc bớt tiếng ồn nền bằng noisereduce trước khi đưa vào Resemblyzer
-            if HAS_NOISEREDUCE and nr is not None and float(np.max(np.abs(wav))) > 1e-4:
+            # 1.5. Lọc thông cao nhẹ 80Hz (Butterworth bậc 2, zero-phase) khử ù quạt/điện, giữ nguyên chất giọng
+            if HAS_SCIPY_SIGNAL and butter is not None and sosfiltfilt is not None and len(wav) > 24 and float(np.max(np.abs(wav))) > 1e-4:
                 try:
-                    reduced_noise = nr.reduce_noise(y=wav, sr=sample_rate)
-                    wav = np.nan_to_num(reduced_noise, nan=0.0, posinf=1.0, neginf=-1.0)
-                except Exception as nr_exc:
+                    nyq = 0.5 * sample_rate
+                    cutoff = 80.0 / nyq
+                    if 0.0 < cutoff < 1.0:
+                        sos = butter(2, cutoff, btype="highpass", output="sos")
+                        filtered = sosfiltfilt(sos, wav).astype(np.float32)
+                        wav = np.nan_to_num(filtered, nan=0.0, posinf=1.0, neginf=-1.0)
+                except Exception:
                     pass
 
             # 2. Tiền xử lý waveform qua Resemblyzer (chuẩn hóa âm lượng, cắt khoảng lặng)
@@ -185,7 +205,7 @@ class VoiceAuthenticator:
         Args:
             audio_data: Dữ liệu âm thanh thô (bytes PCM 16-bit hoặc numpy array).
             sample_rate: Tần số lấy mẫu (mặc định 16000Hz).
-            threshold: Ngưỡng Cosine Similarity tối thiểu (mặc định 0.80).
+            threshold: Ngưỡng Cosine Similarity tối thiểu (mặc định 0.65).
 
         Returns:
             (is_match: bool, similarity: float)
@@ -203,42 +223,55 @@ class VoiceAuthenticator:
         if current_embedding is None:
             return False, 0.0
 
-        # Tính Cosine Similarity giữa 2 vector đơn vị
-        similarity = float(np.dot(current_embedding, self.reference_embedding))
-        is_match = similarity >= target_thresh
+        # Tính Cosine Similarity giữa 2 vector đơn vị (kết hợp đa mẫu nếu có)
+        sim_mean = float(np.dot(current_embedding, self.reference_embedding))
+        if self.sample_embeddings:
+            sim_max = max(float(np.dot(current_embedding, e)) for e in self.sample_embeddings)
+            similarity = 0.4 * sim_mean + 0.6 * sim_max
+        else:
+            similarity = sim_mean
 
-        if not is_match:
-            print(f"[VoiceAuth] Từ chối (cosine < {target_thresh:.2f})")
+        is_match = similarity >= target_thresh
+        decision = "ACCEPT" if is_match else "REJECT"
+        print(f"[VoiceAuth] cosine={similarity:.3f} (ngưỡng {target_thresh:.2f}) -> {decision}")
 
         return is_match, similarity
 
-    def save_profile(self, embedding: np.ndarray, samples_count: int = 10) -> str:
-        """Lưu vector giọng mẫu vào file my_voice.pkl."""
+    def save_profile(
+        self,
+        embedding: np.ndarray,
+        samples_count: int = 5,
+        sample_embeddings: Optional[List[np.ndarray]] = None,
+    ) -> str:
+        """Lưu vector giọng mẫu trung bình và danh sách vector mẫu riêng vào file my_voice.pkl."""
+        embedding = np.array(embedding, dtype=np.float32)
         norm = np.linalg.norm(embedding)
         if norm > 0:
             embedding = embedding / norm
 
+        normalized_samples: List[np.ndarray] = []
+        if sample_embeddings:
+            for s in sample_embeddings:
+                s_arr = np.array(s, dtype=np.float32)
+                s_norm = np.linalg.norm(s_arr)
+                if s_norm > 0:
+                    normalized_samples.append(s_arr / s_norm)
+
         profile_data = {
-            "version": "1.0",
+            "version": "2.0",
             "embedding": embedding,
+            "sample_embeddings": normalized_samples,
             "samples_count": samples_count,
             "created_at": time.time(),
         }
 
-        # Lưu cả ở thư mục hiện tại lẫn get_data_path nếu khác nhau
-        save_path = Path(self.PROFILE_FILENAME)
+        save_path = Path(self.profile_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
         with open(save_path, "wb") as f:
             pickle.dump(profile_data, f)
 
-        data_path = Path(get_data_path(self.PROFILE_FILENAME, default_content=""))
-        if data_path.resolve() != save_path.resolve():
-            try:
-                with open(data_path, "wb") as f:
-                    pickle.dump(profile_data, f)
-            except Exception:
-                pass
-
         self.reference_embedding = embedding
+        self.sample_embeddings = normalized_samples
         print(f"[VoiceAuth] ✓ Đã lưu hồ sơ giọng nói vào '{save_path.resolve()}'.")
         return str(save_path.resolve())
 
@@ -258,7 +291,7 @@ def get_authenticator() -> VoiceAuthenticator:
 def verify_voice(
     audio_data: Union[bytes, np.ndarray],
     sample_rate: int = 16000,
-    threshold: float = 0.80,
+    threshold: float = 0.65,
 ) -> Tuple[bool, float]:
     """
     Hàm tiện ích cấp module để gọi nhanh từ wake_word_engine.py.
